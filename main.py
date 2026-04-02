@@ -1263,13 +1263,11 @@ def _estimate_tokens(messages: list[dict]) -> int:
 # Helpers — LLM calls
 # ---------------------------------------------------------------------------
 
-BASE_URL = os.getenv("BASE_URL", "https://neuralclaw.onrender.com")
-
 _HEADERS = {
     "Authorization": f"Bearer {API_KEY}",
-    "HTTP-Referer": BASE_URL,
-    "X-Title": "AI Chatbot CLAW",
-    "Content-Type": "application/json",
+    "HTTP-Referer":  "https://localhost",
+    "X-Title":       "AI Chatbot CLAW",
+    "Content-Type":  "application/json",
 }
 
 # Placeholder patterns that indicate the model truncated its output
@@ -1420,34 +1418,34 @@ def set_skills():
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
-    if request.content_type and "multipart/form-data" in request.content_type:
-        user_msg = request.form.get("message", "").strip()
-        files    = request.files.getlist("files")
-    else:
-        body     = request.get_json(force=True)
-        user_msg = body.get("message", "").strip()
-        files    = []
-
-    if not user_msg and not files:
-        return jsonify({"error": "Message vide"}), 400
-
     sess = _get_session()
 
-    file_blocks: list[str] = []
-    for f in files:
-        if not f.filename:
-            continue
-        try:
-            content = f.read(250_000).decode("utf-8", errors="replace")
-            file_blocks.append(f"📄 **{f.filename}**:\n```\n{content}\n```")
-        except Exception as exc:
-            logger.warning("File read error %s: %s", f.filename, exc)
-            file_blocks.append(f"📄 **{f.filename}**: [Erreur de lecture]")
+    # On récupère le message, qu'il vienne de JSON ou d'un Formulaire (FormData)
+    if request.is_json:
+        data = request.get_json()
+        user_msg = data.get("message", "").strip()
+    else:
+        user_msg = request.form.get("message", "").strip()
 
+    # --- NOUVEAU : Traitement des fichiers joints ---
+    file_contents = []
+    for f in request.files.getlist("files"):
+        if f.filename:
+            try:
+                content = f.read().decode("utf-8", errors="replace")
+                file_contents.append(f"--- Fichier joint: {f.filename} ---\n{content}")
+            except Exception as e:
+                logger.warning(f"Erreur lecture fichier: {e}")
+
+    # On combine le texte et le contenu des fichiers pour l'IA
     full_msg = user_msg
-    if file_blocks:
-        full_msg += "\n\n" + "\n\n".join(file_blocks)
+    if file_contents:
+        full_msg += "\n\n" + "\n\n".join(file_contents)
 
+    if not full_msg:
+        return jsonify({"error": "Message vide"}), 400
+
+    # On ajoute à l'historique
     sess["messages"].append({"role": "user", "content": full_msg})
 
     payload_messages: list[dict] = []
