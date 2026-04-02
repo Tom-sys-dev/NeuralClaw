@@ -9,7 +9,9 @@ from typing import Any
 import os
 import requests
 from flask import Flask, jsonify, render_template_string, request, session
-
+import asyncio
+from os import system
+import threading
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -21,10 +23,15 @@ DEFAULT_MODEL  = "minimax/minimax-m2.5:free"
 logging.basicConfig(level=logging.INFO, format="%(levelname)s — %(message)s")
 logger = logging.getLogger(__name__)
 
+if not API_KEY:
+    logger.warning("⚠️  OPENROUTER_API_KEY non définie — les appels LLM échoueront.")
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"]   = 50 * 1024 * 1024
 app.config["MAX_FORM_MEMORY_SIZE"] = 50 * 1024 * 1024
-app.secret_key = "change-me-in-production-use-os-urandom"
+# SECRET_KEY stable requis pour que les sessions Flask persistent entre redémarrages
+app.secret_key = os.environ.get("SECRET_KEY") or os.environ.get("FLASK_SECRET_KEY") or "dev-only-secret-change-in-prod-42x"
+app.config["PERMANENT_SESSION_LIFETIME"] = 86400 * 30  # 30 jours
 
 # store[flask_session_id] = { "active_id": uuid, "sessions": { uuid: conv_data } }
 store: dict[str, dict[str, Any]] = {}
@@ -37,6 +44,11 @@ FREE_MODELS: list[dict[str, str]] = [
     {"id": "deepseek/deepseek-r1:free",              "label": "DeepSeek R1"},
     {"id": "qwen/qwen3.6-plus-preview:free",         "label": "Qwen3.6"},
 ]
+
+PING_URL = "https://neuralclaw.onrender.com"  # 🔁 mets ton site ici
+async def ping():
+    system(f"ping -c 4 {PING_URL}")
+    await asyncio.sleep(10)
 
 # ---------------------------------------------------------------------------
 # Prompt Templates
@@ -864,9 +876,15 @@ function applyTemplate() {
    SESSIONS
    ===================================================== */
 async function loadSessions() {
-  const res  = await fetch('/api/sessions');
-  const data = await res.json();
-  renderSessions(data.sessions, data.active_id);
+  try {
+    const res  = await fetch('/api/sessions');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    renderSessions(data.sessions, data.active_id);
+  } catch(e) {
+    console.error('loadSessions error:', e);
+    showToast('❌ Impossible de charger les sessions', 'error');
+  }
 }
 
 function renderSessions(sessions, activeId) {
@@ -884,22 +902,39 @@ function renderSessions(sessions, activeId) {
 }
 
 async function createSession() {
-  const res  = await fetch('/api/sessions', { method: 'POST' });
-  const data = await res.json();
-  await loadSessionData();
-  showToast('✓ Nouvelle conversation créée', 'success');
+  try {
+    const res  = await fetch('/api/sessions', { method: 'POST' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    await loadSessionData();
+    showToast('✓ Nouvelle conversation créée', 'success');
+  } catch(e) {
+    console.error('createSession error:', e);
+    showToast('❌ Erreur création session', 'error');
+  }
 }
 
 async function switchSession(id) {
-  await fetch(`/api/sessions/${id}/activate`, { method: 'POST' });
-  await loadSessionData();
+  try {
+    const res = await fetch(`/api/sessions/${id}/activate`, { method: 'POST' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    await loadSessionData();
+  } catch(e) {
+    console.error('switchSession error:', e);
+    showToast('❌ Erreur changement de session', 'error');
+  }
 }
 
 async function deleteSession(id) {
   if (!confirm('Supprimer cette conversation ?')) return;
-  await fetch(`/api/sessions/${id}`, { method: 'DELETE' });
-  await loadSessionData();
-  showToast('✕ Conversation supprimée', 'success');
+  try {
+    const res = await fetch(`/api/sessions/${id}`, { method: 'DELETE' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    await loadSessionData();
+    showToast('✕ Conversation supprimée', 'success');
+  } catch(e) {
+    console.error('deleteSession error:', e);
+    showToast('❌ Erreur suppression session', 'error');
+  }
 }
 
 function renameSession(id) {
@@ -1137,21 +1172,23 @@ async function sendMessage() {
    RENDER MESSAGE
    ===================================================== */
 function appendMessage(role, text, scroll = true) {
+  // Normalise le rôle : le backend stocke "assistant", le frontend utilise "bot"
+  const displayRole = (role === 'assistant') ? 'bot' : role;
   const container = document.getElementById('messages');
   const typing    = document.getElementById('typing');
 
   const wrapper = document.createElement('div');
-  wrapper.className = `msg-wrapper ${role}`;
+  wrapper.className = `msg-wrapper ${displayRole}`;
 
   const avatar = document.createElement('div');
-  avatar.className = `avatar ${role}`;
-  avatar.textContent = role === 'user' ? '🧑' : '🤖';
+  avatar.className = `avatar ${displayRole}`;
+  avatar.textContent = displayRole === 'user' ? '🧑' : '🤖';
 
   const inner  = document.createElement('div');
   const bubble = document.createElement('div');
-  bubble.className = `bubble ${role}`;
-  bubble.innerHTML = role === 'bot' ? marked.parse(text) : escHtml(text).replace(/\n/g,'<br>');
-  if (role === 'bot') bubble.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+  bubble.className = `bubble ${displayRole}`;
+  bubble.innerHTML = displayRole === 'bot' ? marked.parse(text) : escHtml(text).replace(/\n/g,'<br>');
+  if (displayRole === 'bot') bubble.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
 
   // Copy button
   const copyBtn = document.createElement('button');
@@ -1166,11 +1203,11 @@ function appendMessage(role, text, scroll = true) {
   const time = document.createElement('div');
   time.className = 'msg-time';
   time.textContent = new Date().toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit'});
-  if (role === 'user') time.style.textAlign = 'right';
+  if (displayRole === 'user') time.style.textAlign = 'right';
 
   inner.append(bubble, time);
-  if (role === 'user') wrapper.append(inner, avatar);
-  else                 wrapper.append(avatar, inner);
+  if (displayRole === 'user') wrapper.append(inner, avatar);
+  else                        wrapper.append(avatar, inner);
 
   container.insertBefore(wrapper, typing);
   if (scroll) container.scrollTop = container.scrollHeight;
@@ -1507,6 +1544,7 @@ def _new_conversation(name: str = "Nouvelle conversation") -> dict[str, Any]:
 
 def _get_user_store() -> dict[str, Any]:
     """Return the top-level user store, creating it if absent."""
+    session.permanent = True  # sessions persistent (30 jours)
     fid = session.get("id")
     if not fid or fid not in store:
         fid = str(uuid.uuid4())
@@ -1520,6 +1558,16 @@ def _get_session() -> dict[str, Any]:
     """Return the currently active conversation."""
     us  = _get_user_store()
     aid = us["active_id"]
+    # Robustesse : si l'active_id pointe vers une session inexistante
+    if aid not in us["sessions"]:
+        if us["sessions"]:
+            aid = next(iter(us["sessions"]))
+            us["active_id"] = aid
+        else:
+            conv = _new_conversation("Conversation 1")
+            us["sessions"][conv["id"]] = conv
+            us["active_id"] = conv["id"]
+            aid = conv["id"]
     return us["sessions"][aid]
 
 
@@ -1540,9 +1588,14 @@ def _estimate_tokens(messages: list[dict]) -> int:
 # LLM helpers (same as v2)
 # ---------------------------------------------------------------------------
 
+_APP_URL = (
+    os.environ.get("RENDER_EXTERNAL_URL")
+    or os.environ.get("APP_URL")
+    or "https://localhost"
+)
 _HEADERS = {
     "Authorization": f"Bearer {API_KEY}",
-    "HTTP-Referer":  "https://localhost",
+    "HTTP-Referer":  _APP_URL,
     "X-Title":       "AI Chatbot CLAW v3",
     "Content-Type":  "application/json",
 }
@@ -1692,6 +1745,23 @@ def index() -> str:
     )
 
 
+@app.route("/health")
+def health():
+    """Endpoint de santé pour Render keep-alive."""
+    return jsonify({"status": "ok", "api_key_set": bool(API_KEY)}), 200
+
+
+@app.errorhandler(500)
+def internal_error(exc):
+    logger.error("500 Internal Error: %s", exc)
+    return jsonify({"error": "Erreur serveur interne. Réessaie."}), 500
+
+
+@app.errorhandler(404)
+def not_found(exc):
+    return jsonify({"error": "Route introuvable."}), 404
+
+
 @app.route("/api/context", methods=["POST"])
 def set_context():
     data = request.get_json(force=True)
@@ -1767,6 +1837,9 @@ def chat():
     try:
         response = requests.post(OPENROUTER_URL, headers=_HEADERS, json=payload, timeout=90)
         result   = response.json()
+    except requests.Timeout:
+        sess["messages"].pop()
+        return jsonify({"error": "Délai d'attente dépassé. Réessaie ou choisis un modèle plus rapide."}), 504
     except requests.RequestException as exc:
         sess["messages"].pop()
         return jsonify({"error": f"Erreur réseau: {exc}"}), 502
@@ -1775,7 +1848,15 @@ def chat():
         sess["messages"].pop()
         return jsonify({"error": result["error"].get("message", "Erreur inconnue")}), 502
 
-    reply: str = result["choices"][0]["message"]["content"]
+    choices = result.get("choices") or []
+    if not choices:
+        sess["messages"].pop()
+        return jsonify({"error": "Aucune réponse du modèle. Réessaie ou change de modèle."}), 502
+
+    reply: str = choices[0].get("message", {}).get("content") or ""
+    if not reply:
+        sess["messages"].pop()
+        return jsonify({"error": "Réponse vide reçue du modèle."}), 502
     sess["messages"].append({"role": "assistant", "content": reply})
 
     return jsonify({
@@ -2005,7 +2086,13 @@ def claw_process():
         "validated":  validated,
         "retries":    total_retries,
     })
-
+def start_async_loop():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(ping())
+def start_background_ping():
+    thread = threading.Thread(target=start_async_loop, daemon=True)
+    thread.start()
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -2014,4 +2101,5 @@ if __name__ == "__main__":
     logger.info("🚀 AI Chatbot + CLAW v3")
     # Render donne un port dans la variable PORT, sinon on prend 5000 en local
     port = int(os.environ.get("PORT", 5000))
+    start_background_ping()
     app.run(host="0.0.0.0", port=port)
