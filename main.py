@@ -1263,11 +1263,13 @@ def _estimate_tokens(messages: list[dict]) -> int:
 # Helpers — LLM calls
 # ---------------------------------------------------------------------------
 
+BASE_URL = os.getenv("BASE_URL", "https://neuralclaw.onrender.com")
+
 _HEADERS = {
     "Authorization": f"Bearer {API_KEY}",
-    "HTTP-Referer":  "https://localhost",
-    "X-Title":       "AI Chatbot CLAW",
-    "Content-Type":  "application/json",
+    "HTTP-Referer": BASE_URL,
+    "X-Title": "AI Chatbot CLAW",
+    "Content-Type": "application/json",
 }
 
 # Placeholder patterns that indicate the model truncated its output
