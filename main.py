@@ -21,7 +21,7 @@ import threading
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-API_KEY = "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"
+API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "minimax/minimax-m2.5:free"
