@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import ast
 import json
-import logging
 import re
+import logging
+from typing import List, Dict
 import time
 import uuid
 import zipfile
@@ -12,13 +13,15 @@ from collections import Counter
 from typing import Any
 import os
 import requests
-from flask import Flask, jsonify, render_template_string, request, session, send_file
+from flask import Flask, jsonify, render_template_string, request, session, send_file, Response
 from datetime import datetime
+import urllib.parse
+import threading
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-API_KEY = os.environ.get("OPENROUTER_API_KEY")
+API_KEY = "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"
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "minimax/minimax-m2.5:free"
@@ -37,14 +40,17 @@ store: dict[str, dict[str, Any]] = {}
 # Available free models on OpenRouter
 # ---------------------------------------------------------------------------
 FREE_MODELS: list[dict[str, str]] = [
-    {"id": "minimax/minimax-m2.5:free",              "label": "MiniMax M2.5"},
+    {"id": "minimax/minimax-m2.5:free", "label": "MiniMax M2.5"},
     {"id": "meta-llama/llama-3.3-70b-instruct:free", "label": "Llama 3.3 70B"},
-    {"id": "qwen/qwen3.6-plus-preview:free",         "label": "Qwen3.6"},
-    {"id": "stepfun/step-3.5-flash:free",         "label": "step 3.5"},
-    {"id": "nvidia/nemotron-3-super-120b-a12b:free",         "label": "nemotron 3"},
-
-
+    {"id": "stepfun/step-3.5-flash:free", "label": "step 3.5"},
+    {"id": "nvidia/nemotron-3-super-120b-a12b:free", "label": "nemotron 3"},
 ]
+
+# ---------------------------------------------------------------------------
+# Système de tâches CLAW avec SSE
+# ---------------------------------------------------------------------------
+claw_tasks = {}  # Dictionnaire global pour stocker les tâches
+claw_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Language Detection & Mapping
@@ -215,7 +221,12 @@ _SYS_DEV_TEMPLATE = (
     "7. Ajoute des docstrings/commentaires appropriés\n"
     "8. Gère les erreurs et cas limites\n"
     "9. Inclus les imports/dépendances nécessaires\n"
-    "10. Structure le code de manière modulaire"
+    "10. Structure le code de manière modulaire\n"
+    "11. ⚠️ INTERDICTION STRICTE : Ne supprime JAMAIS de code fonctionnel existant. "
+    "Si tu ajoutes des fonctionnalités, le code peut s'allonger. Si tu dois remplacer une section, "
+    "assure-toi que la nouvelle version est équivalente ou supérieure en fonctionnalités. "
+    "La suppression de code n'est autorisée que si elle est compensée par une implémentation "
+    "équivalente ou meilleure dans la même passe.\n"
 )
 
 _SYS_DEV = {
@@ -328,7 +339,7 @@ _PLACEHOLDER_PATTERNS = re.compile(
 )
 
 
-def _call_llm_raw(messages: list[dict], model: str, timeout: int = 90) -> str | None:
+def _call_llm_raw(messages: list[dict], model: str, timeout: int = 180) -> str | None:
     """Single LLM call. Returns content string or None on failure."""
     payload = {"model": model, "messages": messages, "max_tokens": 65000}
     try:
@@ -385,6 +396,107 @@ def _call_llm(messages: list[dict], model: str) -> str:
 # ---------------------------------------------------------------------------
 # Helpers — code utilities
 # ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
+
+
+def perform_search(query: str, max_results: int = 5) -> str:
+    """
+    Effectue une recherche sur Internet (DuckDuckGo) et retourne les résultats.
+    L'IA peut appeler cet outil avec \recherche <query>.
+
+    Parameters
+    ----------
+    query : str
+        Terme de recherche.
+    max_results : int, optional
+        Nombre maximal de résultats à renvoyer (défaut : 5).
+
+    Returns
+    -------
+    str
+        Texte formaté contenant les titres, URLs et extraits des résultats.
+    """
+    try:
+        # ---------- Pré‑préparation de la requête ----------
+        encoded_query = urllib.parse.quote(query)
+        # DuckDuckGo Instant Answer API (JSON, sans HTML)
+        ddg_url = "https://api.duckduckgo.com/"
+        params: Dict[str, str] = {
+            "q": encoded_query,
+            "format": "json",
+            "no_html": "1",
+            "skip_disambig": "1",
+        }
+
+        # ---------- Appel à l’API ----------
+        response = requests.get(ddg_url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        # ---------- Construction du texte de sortie ----------
+        results: List[str] = []
+
+        # Informations globales (nombre approximatif de résultats)
+        # DuckDuckGo ne renvoie pas toujours un compte exact ; on utilise AbstractText quand disponible.
+        abstract = data.get("AbstractText", "").strip()
+        abstract_src = data.get("AbstractSource", "").strip()
+        abstract_url = data.get("AbstractURL", "").strip()
+
+        if abstract:
+            results.append(
+                f"🔎 **Résultat instantané** (source : {abstract_src or 'DuckDuckGo'})\n"
+                f"{abstract}\n"
+                f"🔗 {abstract_url}\n"
+            )
+        else:
+            results.append(f"🔍 Recherche Internet pour « {query} » :\n")
+
+        # Résultats classiques (RelatedTopics) – chaque entrée peut contenir un texte et une URL
+        related: List[Dict] = data.get("RelatedTopics", [])
+        count = 0
+
+        for item in related:
+            if count >= max_results:
+                break
+
+            # Certaines entrées sont simplement des catégories (sans 'FirstURL')
+            if isinstance(item, dict) and "FirstURL" in item:
+                title = item.get("Text", "Titre inconnu").split(" – ")[0]  # on garde le texte avant le tiret
+                snippet = re.sub(r"<[^>]+>", "", item.get("Text", ""))  # nettoyage éventuel de balises
+                url = item.get("FirstURL", "#")
+                results.append(
+                    f"{count + 1}. **{title}**\n"
+                    f"{snippet[:200]}…\n"
+                    f"🔗 {url}\n"
+                )
+                count += 1
+            # Dans le cas où le sujet est une sous‑liste (ex. « RelatedTopics » contenant d’autres dicts)
+            elif isinstance(item, dict) and "Topics" in item:
+                for sub in item["Topics"]:
+                    if count >= max_results:
+                        break
+                    title = sub.get("Text", "Titre inconnu").split(" – ")[0]
+                    snippet = re.sub(r"<[^>]+>", "", sub.get("Text", ""))
+                    url = sub.get("FirstURL", "#")
+                    results.append(
+                        f"{count + 1}. **{title}**\n"
+                        f"{snippet[:200]}…\n"
+                        f"🔗 {url}\n"
+                    )
+                    count += 1
+
+        if count == 0 and not abstract:
+            results.append("❌ Aucun résultat trouvé pour cette requête.")
+
+        return "\n".join(results)
+
+    except requests.RequestException as e:
+        logger.error(f"Erreur lors de la recherche Internet : {e}")
+        return f"❌ Erreur de connexion : {str(e)}"
+    except Exception as e:
+        logger.error(f"Erreur inattendue lors de la recherche Internet : {e}")
+        return f"❌ Erreur inattendue : {str(e)}"
+
 
 def _clean_code_block(text: str) -> str:
     """
@@ -421,10 +533,10 @@ def _has_placeholders(code: str) -> bool:
     return bool(_PLACEHOLDER_PATTERNS.search(code))
 
 
-def _is_code_shorter(new_code: str, old_code: str, threshold: float = 0.70) -> bool:
+def _is_code_shorter(new_code: str, old_code: str, threshold: float = 0.90) -> bool:
     """
     Return True if new_code is suspiciously shorter than old_code.
-    Threshold: new must be at least 70 % of old length to be accepted.
+    Threshold: new must be at least 90% of old length to be accepted.
     """
     if not old_code or len(old_code) < 200:
         return False
@@ -581,11 +693,15 @@ def index() -> str:
 def set_context():
     data = request.get_json(force=True)
     sess = _get_session()
-    sess["system_prompt"] = data.get("system_prompt", "").strip()
-    if data.get("model"):
+
+    # Met à jour seulement les champs fournis
+    if "system_prompt" in data:
+        sess["system_prompt"] = data["system_prompt"].strip()
+    if "model" in data:
         sess["model"] = data["model"]
     if "skills" in data:
         sess["skills"] = [s for s in data["skills"] if isinstance(s, str)]
+
     return jsonify({"ok": True})
 
 
@@ -601,14 +717,14 @@ def set_skills():
 def chat():
     sess = _get_session()
 
-    # On récupère le message, qu'il vienne de JSON ou d'un Formulaire (FormData)
+    # Récupération du message
     if request.is_json:
         data = request.get_json()
         user_msg = data.get("message", "").strip()
     else:
         user_msg = request.form.get("message", "").strip()
 
-    # --- NOUVEAU : Traitement des fichiers joints ---
+    # Gestion des fichiers joints
     file_contents = []
     for f in request.files.getlist("files"):
         if f.filename:
@@ -618,7 +734,6 @@ def chat():
             except Exception as e:
                 logger.warning(f"Erreur lecture fichier: {e}")
 
-    # On combine le texte et le contenu des fichiers pour l'IA
     full_msg = user_msg
     if file_contents:
         full_msg += "\n\n" + "\n\n".join(file_contents)
@@ -626,47 +741,111 @@ def chat():
     if not full_msg:
         return jsonify({"error": "Message vide"}), 400
 
-    # On ajoute à l'historique
+    # Construire le contexte système avec mention de l'outil de recherche
+    sys_content = _build_system_content(sess)
+
+    #  système qui présente l'outil de recherche à l'IA
+    tool_instruction = (
+        "\n\nOUTILS DISPONIBLES:\n"
+        "Tu as accès à un outil de recherche internet . Pour l'utiliser, "
+        "tappe exactement: \\recherche <ta question>\n"
+        "Exemple: \\recherche comment créer une classe en Python\n"
+        "Le système remplacera cette commande par les résultats de recherche "
+        "pour que tu puisses rédiger une réponse complète et précise.\n"
+        "IMPORTANT: Utilise cet outil pour les questions factuelles, techniques, "
+        "ou qui nécessitent des informations à jour que tu ne connaisrais pas."
+    )
+
+    if sys_content:
+        full_sys_content = sys_content + tool_instruction
+    else:
+        full_sys_content = tool_instruction.strip()
+
+    # Ajouter le message utilisateur à l'historique
     sess["messages"].append({"role": "user", "content": full_msg})
 
-    payload_messages: list[dict] = []
-    sys_content = _build_system_content(sess)
-    if sys_content:
-        payload_messages.append({"role": "system", "content": sys_content})
+    # Construire les messages pour l'API
+    payload_messages = [{"role": "system", "content": full_sys_content}]
     payload_messages.extend(sess["messages"])
 
-    payload = {"model": sess["model"], "messages": payload_messages, "max_tokens": 65000}
-    try:
-        response = requests.post(OPENROUTER_URL, headers=_HEADERS, json=payload, timeout=90)
-        result = response.json()
-    except requests.RequestException as exc:
-        logger.error(f"❌ Erreur de connexion OpenRouter: {exc}")
-        # Si on a une réponse du serveur, on log le texte brut pour debug
-        if exc.response is not None:
-            logger.error(f"Détail de la réponse: {exc.response.text}")
-        sess["messages"].pop()
-        return jsonify({"error": "Problème de connexion au service AI"}), 502
+    # --- BOUCLE DE RECHERCHE ---
+    # L'IA peut demander plusieurs recherches successives
+    max_search_attempts = 5
+    search_count = 0
+    final_reply = None
 
-    if "error" in result:
-        err_data = result["error"]
-        # On récupère plus de détails (message, code, métadonnées)
-        detailed_msg = err_data.get("message", "Erreur inconnue")
-        err_code = err_data.get("code", "N/A")
+    while search_count < max_search_attempts:
+        # Appel à l'IA
+        payload = {"model": sess["model"], "messages": payload_messages, "max_tokens": 65000}
+        try:
+            response = requests.post(OPENROUTER_URL, headers=_HEADERS, json=payload, timeout=90)
+            result = response.json()
+        except requests.RequestException as exc:
+            logger.error(f"❌ Erreur de connexion OpenRouter: {exc}")
+            sess["messages"].pop()  # Retirer le message utilisateur
+            return jsonify({"error": "Problème de connexion au service AI"}), 502
 
-        # Log complet pour vous dans les logs Render
-        logger.error(f"🚨 OpenRouter Error [{err_code}]: {detailed_msg}")
-        if "metadata" in err_data:
-            logger.error(f"Metadata: {err_data['metadata']}")
+        if "error" in result:
+            err_data = result["error"]
+            detailed_msg = err_data.get("message", "Erreur inconnue")
+            err_code = err_data.get("code", "N/A")
+            logger.error(f"🚨 OpenRouter Error [{err_code}]: {detailed_msg}")
+            if "metadata" in err_data:
+                logger.error(f"Metadata: {err_data['metadata']}")
+            sess["messages"].pop()
+            return jsonify({"error": f"IA indisponible ({err_code}): {detailed_msg}"}), 502
 
-        sess["messages"].pop()
-        # On renvoie un message plus précis à l'utilisateur
-        return jsonify({"error": f"IA indisponible ({err_code}): {detailed_msg}"}), 502
+        reply: str = result["choices"][0]["message"]["content"]
 
-    reply: str = result["choices"][0]["message"]["content"]
-    sess["messages"].append({"role": "assistant", "content": reply})
+        # Vérifier si l'IA demande une recherche
+        if reply.strip().startswith('\\recherche '):
+            search_count += 1
+            query = reply.strip()[len('\\recherche '):].strip()
+
+            if not query:
+                # Si pas de requête, on continue sans faire de recherche
+                payload_messages.append({"role": "assistant", "content": reply})
+                continue
+
+            logger.info(f"🔍 Recherche demandée par l'IA: {query}")
+
+            # Effectuer la recherche
+            search_results = perform_search(query)
+
+            # Ajouter la commande de recherche à l'historique
+            payload_messages.append({"role": "assistant", "content": reply})
+
+            # Ajouter les résultats comme message système
+            payload_messages.append({
+                "role": "system",
+                "content": f"RÉSULTATS DE RECHERCHE pour '{query}':\n{search_results}\n\nTu peux maintenant rédiger ta réponse finale basée sur ces résultats."
+            })
+
+            # Continuer la boucle pour que l'IA rédige sa réponse
+            continue
+        else:
+            # Réponse finale (pas de recherche demandée)
+            final_reply = reply
+            payload_messages.append({"role": "assistant", "content": reply})
+            break
+
+    if final_reply is None:
+        # Si on a atteint le maximum de recherches sans réponse finale
+        if search_count >= max_search_attempts:
+            error_msg = "⚠️ Limite de recherches atteinte. L'IA n'a pas fourni de réponse finale."
+        else:
+            error_msg = "❌ Erreur lors de la génération de la réponse."
+        return jsonify({"reply": error_msg})
+
+    # Mettre à jour l'historique de la session
+    # On filtre pour ne garder que les messages user/assistant (pas les systèmes intermédiaires)
+    sess["messages"] = [
+        msg for msg in payload_messages
+        if msg["role"] in ["user", "assistant"]
+    ]
 
     return jsonify({
-        "reply": reply,
+        "reply": final_reply,
         "total_messages": len(sess["messages"]),
         "estimated_tokens": _estimate_tokens(sess["messages"]),
     })
@@ -692,269 +871,349 @@ def history():
 
 
 # ---------------------------------------------------------------------------
-# CLAW ENGINE v3 — Enhanced with language detection, versioning, export
+# CLAW ENGINE v3 — Enhanced with language detection, versioning, export, SSE
 # ---------------------------------------------------------------------------
-
-# Each iteration has a clearly specialised focus
-_ITER_FOCUS = {
-    1: "implémentation initiale complète et fonctionnelle",
-    2: "correction des bugs, cas limites et robustesse",
-    3: "optimisation, lisibilité et qualité finale",
-}
-
 
 @app.route("/api/claw/process", methods=["POST"])
 def claw_process():
     """
-    CLAW v3 — Enhanced pipeline with:
-      - Automatic language detection
-      - Language-specific prompts
-      - Version tracking (all iterations)
-      - Syntax validation for Python
-      - Smart retry logic
+    Démarre une tâche CLAW en arrière-plan et retourne un task_id.
     """
-    sess = _get_session()
     objective = request.form.get("objective", "").strip()
     if not objective:
         return jsonify({"error": "Veuillez définir un objectif clair."}), 400
 
-    model = sess["model"]
+    model = _get_session()["model"]
 
-    # ── Load uploaded files ──────────────────────────────────
-    files: list[str] = []
+    # Charger les fichiers
+    files = []
     file_names = []
     for f in request.files.getlist("claw_files"):
         if not f.filename:
             continue
         try:
             content = f.read().decode("utf-8", errors="replace")
-            if len(content) > 30_000:
-                content = content[:30_000] + "\n\n…[tronqué à 30 000 caractères]"
             files.append(f"### {f.filename}\n{content}")
             file_names.append(f.filename)
         except Exception as exc:
             logger.warning("CLAW file read error: %s", exc)
 
-    # Detect language
-    language = _detect_language(file_names, objective)
-    logger.info(f"CLAW: Detected language = {language}")
+    # Créer un task_id
+    task_id = str(uuid.uuid4())
+    with claw_lock:
+        claw_tasks[task_id] = {
+            'logs': [],
+            'status': 'running',
+            'progress': 0,
+            'result': None,
+            'error': None
+        }
 
-    current_code: str = (
-        "\n\n".join(files)
-        if files
-        else "# Aucun code initial — génère la structure complète depuis zéro."
+    # Lancer la tâche dans un thread séparé
+    thread = threading.Thread(
+        target=run_claw_task,
+        args=(task_id, objective, files, file_names, model)
     )
+    thread.daemon = True
+    thread.start()
 
-    # ── State ────────────────────────────────────────────────
-    logs: list[str] = []
-    improvements: list[str] = []
-    total_retries: int = 0
-    validated: bool = False
-    success: bool = True
-    versions: list[str] = [current_code]  # Stocke toutes les versions
+    return jsonify({"task_id": task_id})
 
-    def log(msg: str = "") -> None:
-        logs.append(msg)
-        logger.info("CLAW | %s", msg)
 
-    # Get language-specific system prompt
-    sys_dev = _SYS_DEV.get(language, _SYS_DEV['python'])
+def run_claw_task(task_id, objective, files, file_names, model):
+    """
+    Exécute la boucle CLAW et stocke les résultats dans claw_tasks[task_id].
+    """
+    try:
+        # Détection du langage
+        language = _detect_language(file_names, objective)
+        logger.info(f"CLAW: Detected language = {language}")
 
-    # ── Main loop ────────────────────────────────────────────
-    for iteration in range(1, 4):
-        focus = _ITER_FOCUS[iteration]
-        log()
-        log(f"══ Itération {iteration}/3 — {focus} ══")
+        current_code = "\n\n".join(
+            files) if files else "# Aucun code initial — génère la structure complète depuis zéro."
 
-        # ── 1. Plan ──────────────────────────────────────────
-        log("   📝 Planification…")
-        improvement_context = (
-            "\n".join(f"  - {p}" for p in improvements)
-            if improvements else "Aucune (première itération)"
-        )
-        plan, retries = _call_llm_with_retry([
-            {"role": "system", "content": _SYS_ARCHITECT},
-            {"role": "user", "content": (
-                f"OBJECTIF: {objective}\n\n"
-                f"FOCUS DE CETTE ITÉRATION: {focus}\n\n"
-                f"LANGAGE: {language}\n\n"
-                f"CODE ACTUEL ({len(current_code)} caractères):\n{current_code}\n\n"
-                f"POINTS À CORRIGER/AMÉLIORER (itérations précédentes):\n{improvement_context}"
-            )},
-        ], model)
-        total_retries += retries
+        logs = []
+        improvements = []
+        total_retries = 0
+        validated = False
+        success = True
+        versions = [current_code]
 
-        if not plan:
-            log("   ❌ Planification échouée après plusieurs tentatives")
-            success = False
-            break
-        log("   ✅ Plan établi")
-        log()
+        def log(msg=""):
+            logs.append(msg)
+            # Stocker le log dans la tâche
+            with claw_lock:
+                claw_tasks[task_id]['logs'].append(msg)
+                claw_tasks[task_id]['progress'] = min(99, int((len(versions) / 10) * 100))
 
-        # ── 2. Critique ──────────────────────────────────────
-        log("   🔍 Critique du plan…")
-        critique, retries = _call_llm_with_retry([
-            {"role": "system", "content": _SYS_CRITIC},
-            {"role": "user", "content": (
-                f"OBJECTIF: {objective}\n\n"
-                f"LANGAGE: {language}\n\n"
-                f"PLAN À CRITIQUER:\n{plan}\n\n"
-                f"CODE ACTUEL:\n{current_code}"
-            )},
-        ], model)
-        total_retries += retries
+        # Get language-specific system prompt
+        sys_dev = _SYS_DEV.get(language, _SYS_DEV['python'])
 
-        if not critique:
-            log("   ⚠️  Critique indisponible — on continue avec le plan tel quel")
-            critique = "(pas de critique disponible)"
-        else:
-            log("   ✅ Critique prête")
+        # ── Main loop ────────────────────────────────────────────
+        max_iterations = 10  # Safety limit
+        iteration = 0
 
-        # ── 3. Implement + validate ───────────────────────────
-        log("   ⚙️  Implémentation du code…")
-        raw_code, retries = _call_llm_with_retry([
-            {"role": "system", "content": sys_dev},
-            {"role": "user", "content": (
-                f"OBJECTIF: {objective}\n\n"
-                f"LANGAGE: {language}\n\n"
-                f"FOCUS: {focus}\n\n"
-                f"PLAN VALIDÉ:\n{plan}\n\n"
-                f"CRITIQUES À INTÉGRER:\n{critique}\n\n"
-                f"CODE ACTUEL À AMÉLIORER/COMPLÉTER ({len(current_code)} caractères):\n"
-                f"{current_code}\n\n"
-                f"RAPPEL: Génère la totalité du code, sans troncature ni placeholder."
-            )},
-        ], model)
-        total_retries += retries
+        while iteration < max_iterations:
+            iteration += 1
 
-        if not raw_code:
-            log("   ❌ Implémentation échouée après plusieurs tentatives")
-            success = False
-            break
-
-        candidate = _clean_code_block(raw_code)
-
-        # Guard: reject suspiciously short output (regression)
-        if _is_code_shorter(candidate, current_code):
-            log("   ⚠️  Code généré trop court — probable troncature, on conserve la version précédente")
-            log(f"      (ancien: {len(current_code)} chars / nouveau: {len(candidate)} chars)")
-        else:
-            # Guard: detect placeholder truncation
-            if _has_placeholders(candidate):
-                log("   ⚠️  Placeholders détectés (code incomplet) — tentative de correction…")
-                fixed, retries2 = _call_llm_with_retry([
-                    {"role": "system", "content": sys_dev},
-                    {"role": "user", "content": (
-                        f"Le code suivant contient des placeholders comme '# TODO', '...', '# rest of code'.\n"
-                        f"Remplace-les par une implémentation réelle complète.\n\n"
-                        f"OBJECTIF: {objective}\n\n"
-                        f"LANGAGE: {language}\n\n"
-                        f"CODE INCOMPLET:\n{candidate}"
-                    )},
-                ], model)
-                total_retries += retries2
-                if fixed and not _is_code_shorter(_clean_code_block(fixed), current_code):
-                    candidate = _clean_code_block(fixed)
-                    log("   🔄 Code complété après correction des placeholders")
-
-            current_code = candidate
-            versions.append(current_code)
-            log(f"   🎯 Code généré ({len(current_code):,} caractères)")
-
-        # Syntax validation (Python only)
-        if language == 'python':
-            validated, syntax_error = _validate_python_syntax(current_code)
-            if validated:
-                log("   ✅ Syntaxe Python valide")
+            # Determine focus for this iteration
+            if iteration == 1:
+                focus = "implémentation initiale complète et fonctionnelle"
+            elif iteration == 2:
+                focus = "correction des bugs, cas limites et robustesse"
+            elif iteration == 3:
+                focus = "optimisation, lisibilité et qualité finale"
             else:
-                log(f"   ⚠️  Erreur de syntaxe : {syntax_error} — tentative de correction…")
-                fixed_syntax, retries3 = _call_llm_with_retry([
-                    {"role": "system", "content": _SYS_FIX_SYNTAX.format(language=language)},
-                    {"role": "user", "content": (
-                        f"ERREUR: {syntax_error}\n\n"
-                        f"LANGAGE: {language}\n\n"
-                        f"CODE À CORRIGER:\n{current_code}"
-                    )},
-                ], model)
-                total_retries += retries3
-                if fixed_syntax:
-                    candidate2 = _clean_code_block(fixed_syntax)
-                    ok2, _ = _validate_python_syntax(candidate2)
-                    if ok2:
-                        current_code = candidate2
-                        versions[-1] = current_code  # Update last version
-                        validated = True
-                        log("   ✅ Syntaxe corrigée avec succès")
-                    else:
-                        log("   ❌ Correction syntaxique échouée — on conserve le code actuel")
+                focus = f"itération supplémentaire d'optimisation ({iteration})"
+
+            log()
+            log(f"══ Itération {iteration} — {focus} ══")
+
+            # ── 1. Plan ──────────────────────────────────────────
+            log("   📝 Planification…")
+            improvement_context = (
+                "\n".join(f"  - {p}" for p in improvements)
+                if improvements else "Aucune (première itération)"
+            )
+            plan, retries = _call_llm_with_retry([
+                {"role": "system", "content": _SYS_ARCHITECT},
+                {"role": "user", "content": (
+                    f"OBJECTIF: {objective}\n\n"
+                    f"FOCUS DE CETTE ITÉRATION: {focus}\n\n"
+                    f"LANGAGE: {language}\n\n"
+                    f"CODE ACTUEL ({len(current_code)} caractères):\n{current_code}\n\n"
+                    f"POINTS À CORRIGER/AMÉLIORER (itérations précédentes):\n{improvement_context}\n\n"
+                )},
+            ], model)
+            total_retries += retries
+
+            if not plan:
+                log("   ❌ Planification échouée après plusieurs tentatives")
+                success = False
+                break
+            log("   ✅ Plan établi")
+            log()
+
+            # ── 2. Critique ──────────────────────────────────────
+            log("   🔍 Critique du plan…")
+            critique, retries = _call_llm_with_retry([
+                {"role": "system", "content": _SYS_CRITIC},
+                {"role": "user", "content": (
+                    f"OBJECTIF: {objective}\n\n"
+                    f"LANGAGE: {language}\n\n"
+                    f"PLAN À CRITIQUER:\n{plan}\n\n"
+                    f"CODE ACTUEL:\n{current_code}"
+                )},
+            ], model)
+            total_retries += retries
+
+            if not critique:
+                log("   ⚠️  Critique indisponible — on continue avec le plan tel quel")
+                critique = "(pas de critique disponible)"
+            else:
+                log("   ✅ Critique prête")
+
+            # ── 3. Implement + validate ───────────────────────────
+            log("   ⚙️  Implémentation du code…")
+            raw_code, retries = _call_llm_with_retry([
+                {"role": "system", "content": sys_dev},
+                {"role": "user", "content": (
+                    f"OBJECTIF: {objective}\n\n"
+                    f"LANGAGE: {language}\n\n"
+                    f"FOCUS: {focus}\n\n"
+                    f"PLAN VALIDÉ:\n{plan}\n\n"
+                    f"CRITIQUES À INTÉGRER:\n{critique}\n\n"
+                    "‼️ RÈGLE CRITIQUE : NE SUPPRIME PAS DE CODE FONCTIONNEL EXISTANT.\n"
+                    "Si le code actuel fonctionne, toute modification doit préserver toutes ses fonctionnalités.\n"
+                    "Tu peux ajouter, refactoriser ou améliorer, mais jamais supprimer sans remplacement équivalent.\n"
+                    "Le code final doit être AU MOINS AUSSI COMPLET que le code actuel.\n\n"
+                    f"CODE ACTUEL À AMÉLIORER/COMPLÉTER ({len(current_code)} caractères):\n"
+                    f"{current_code}\n\n"
+                    f"RAPPEL: Génère la totalité du code, sans troncature ni placeholder."
+                )},
+            ], model)
+            total_retries += retries
+
+            if not raw_code:
+                log("   ❌ Implémentation échouée après plusieurs tentatives")
+                success = False
+                break
+
+            candidate = _clean_code_block(raw_code)
+
+            # Guard: reject suspiciously short output (regression)
+            if _is_code_shorter(candidate, current_code):
+                log("   ⚠️  Code généré trop court — probable troncature, on conserve la version précédente")
+                log(f"      (ancien: {len(current_code)} chars / nouveau: {len(candidate)} chars)")
+            else:
+                # Guard: detect placeholder truncation
+                if _has_placeholders(candidate):
+                    log("   ⚠️  Placeholders détectés (code incomplet) — tentative de correction…")
+                    fixed, retries2 = _call_llm_with_retry([
+                        {"role": "system", "content": sys_dev},
+                        {"role": "user", "content": (
+                            f"Le code suivant contient des placeholders comme '# TODO', '...', '# rest of code'.\n"
+                            f"Remplace-les par une implémentation réelle complète.\n\n"
+                            f"OBJECTIF: {objective}\n\n"
+                            f"LANGAGE: {language}\n\n"
+                            f"CODE INCOMPLET:\n{candidate}"
+                        )},
+                    ], model)
+                    total_retries += retries2
+                    if fixed and not _is_code_shorter(_clean_code_block(fixed), current_code):
+                        candidate = _clean_code_block(fixed)
+                        log("   🔄 Code complété après correction des placeholders")
+
+                current_code = candidate
+                versions.append(current_code)
+                log(f"   🎯 Code généré ({len(current_code):,} caractères)")
+
+            # Syntax validation (Python only)
+            if language == 'python':
+                validated, syntax_error = _validate_python_syntax(current_code)
+                if validated:
+                    log("   ✅ Syntaxe Python valide")
                 else:
-                    log("   ❌ Impossible d'obtenir une correction syntaxique")
-        else:
-            validated = False  # Non-Python languages not validated yet
-            log(f"   ℹ️  Validation syntaxique non disponible pour {language}")
-
-        # ── 4. Improvement analysis ───────────────────────────
-        log("   🔬 Analyse des améliorations pour la prochaine itération…")
-        improve_raw, retries = _call_llm_with_retry([
-            {"role": "system", "content": _SYS_IMPROVE},
-            {"role": "user", "content": (
-                f"OBJECTIF: {objective}\n\n"
-                f"LANGAGE: {language}\n\n"
-                f"CODE (itération {iteration}):\n{current_code}"
-            )},
-        ], model)
-        total_retries += retries
-
-        if improve_raw:
-            # Parse numbered list into structured items
-            improvements = [
-                               line.lstrip("0123456789.-) ").strip()
-                               for line in improve_raw.splitlines()
-                               if line.strip() and line.strip()[0].isdigit()
-                           ][:10]
-            if improvements:
-                log(f"   🧠 {len(improvements)} point(s) d'amélioration identifiés")
+                    log(f"   ⚠️  Erreur de syntaxe : {syntax_error} — tentative de correction…")
+                    fixed_syntax, retries3 = _call_llm_with_retry([
+                        {"role": "system", "content": _SYS_FIX_SYNTAX.format(language=language)},
+                        {"role": "user", "content": (
+                            f"ERREUR: {syntax_error}\n\n"
+                            f"LANGAGE: {language}\n\n"
+                            f"CODE À CORRIGER:\n{current_code}\n\n"
+                            "corrige ce programmme pour ne plus avoir cette erreur"
+                        )},
+                    ], model)
+                    total_retries += retries3
+                    if fixed_syntax:
+                        candidate2 = _clean_code_block(fixed_syntax)
+                        ok2, _ = _validate_python_syntax(candidate2)
+                        if ok2:
+                            current_code = candidate2
+                            versions[-1] = current_code  # Update last version
+                            validated = True
+                            log("   ✅ Syntaxe corrigée avec succès")
+                        else:
+                            log("   ❌ Correction syntaxique échouée — on conserve le code actuel")
+                    else:
+                        log("   ❌ Impossible d'obtenir une correction syntaxique")
             else:
-                log("   ⚠️  Suggestions non structurées (ignorées)")
+                validated = False  # Non-Python languages not validated yet
+                log(f"   ℹ️  Validation syntaxique non disponible pour {language}")
+
+            # ── 4. Improvement analysis ───────────────────────────
+            log("   🔬 Analyse des améliorations pour la prochaine itération…")
+            improve_raw, retries = _call_llm_with_retry([
+                {"role": "system", "content": _SYS_IMPROVE},
+                {"role": "user", "content": (
+                    f"OBJECTIF: {objective}\n\n"
+                    f"LANGAGE: {language}\n\n"
+                    f"CODE (itération {iteration}):\n{current_code}"
+                )},
+            ], model)
+            total_retries += retries
+
+            if improve_raw:
+                improvements = [
+                                   line.lstrip("0123456789.-) ").strip()
+                                   for line in improve_raw.splitlines()
+                                   if line.strip() and line.strip()[0].isdigit()
+                               ][:10]
+                if improvements:
+                    log(f"   🧠 {len(improvements)} point(s) d'amélioration identifiés")
+                else:
+                    log("   ⚠️  Aucune amélioration identifiée — la boucle s'arrête.")
+                    improvements = []  # Ensure empty
+                    break  # Exit loop because no improvements
+            else:
+                log("   ⚠️  Aucune suggestion d'amélioration obtenue — la boucle s'arrête.")
+                improvements = []
+                break
+
+            log(f"✅ Itération {iteration} terminée")
+
+        # ── Final result ─────────────────────────────────────────
+        log()
+        if success and iteration > 0:
+            log("🏁 Boucle CLAW v3 terminée avec succès !")
+            log(f"📦 Code final : {len(current_code):,} caractères")
+            log(f"🔢 Itérations effectuées : {iteration}")
+            if validated:
+                log("🟢 Syntaxe Python validée")
+            if total_retries:
+                log(f"🔄 Retentatives totales : {total_retries}")
         else:
-            log("   ⚠️  Aucune suggestion d'amélioration obtenue")
+            log("⚠️  Boucle CLAW interrompue suite à une erreur.")
 
-        log(f"✅ Itération {iteration}/3 terminée")
+        final_code = (
+            current_code
+            if current_code and "Aucun code initial" not in current_code
+            else None
+        )
 
-    # ── Final result ─────────────────────────────────────────
-    log()
-    if success:
-        log("🏁 Boucle CLAW v3 terminée avec succès !")
-        log(f"📦 Code final : {len(current_code):,} caractères")
-        if validated:
-            log("🟢 Syntaxe Python validée")
-        if total_retries:
-            log(f"🔄 Retentatives totales : {total_retries}")
-    else:
-        log("⚠️  Boucle CLAW interrompue suite à une erreur.")
+        result = {
+            "logs": logs,
+            "final_code": final_code,
+            "success": success,
+            "iterations": iteration if success else None,
+            "char_count": len(final_code) if final_code else 0,
+            "validated": validated,
+            "retries": total_retries,
+            "versions": versions,
+            "language": language,
+            "file_extension": _get_file_extension(language),
+        }
+        with claw_lock:
+            claw_tasks[task_id]['result'] = result
+            claw_tasks[task_id]['status'] = 'complete' if success else 'error'
+            claw_tasks[task_id]['progress'] = 100
 
-    final_code = (
-        current_code
-        if current_code and "Aucun code initial" not in current_code
-        else None
-    )
+    except Exception as e:
+        logger.error(f"Erreur dans run_claw_task: {e}")
+        with claw_lock:
+            claw_tasks[task_id]['status'] = 'error'
+            claw_tasks[task_id]['error'] = str(e)
 
-    # Store versions in session for later export
-    sess['claw_versions'] = versions
-    sess['claw_language'] = language
 
-    return jsonify({
-        "logs": logs,
-        "final_code": final_code,
-        "success": success,
-        "iterations": 3 if success else None,
-        "char_count": len(final_code) if final_code else 0,
-        "validated": validated,
-        "retries": total_retries,
-        "versions": versions,  # All versions (initial + 3 iterations)
-        "language": language,
-        "file_extension": _get_file_extension(language),
-    })
+@app.route("/api/claw/stream")
+def claw_stream():
+    """
+    Stream les logs de la tâche CLAW en cours via SSE.
+    Le client doit fournir le task_id en query parameter.
+    """
+    task_id = request.args.get("task_id")
+    if not task_id or task_id not in claw_tasks:
+        return jsonify({"error": "Tâche inconnue"}), 404
+
+    task = claw_tasks[task_id]
+
+    def generate():
+        # Envoyer les logs existants d'abord
+        for log in task['logs']:
+            yield f"data: {json.dumps({'type': 'log', 'message': log})}\n\n"
+
+        # Puis suivre les nouveaux logs
+        last_index = len(task['logs'])
+        while task['status'] == 'running':
+            # Vérifier les nouveaux logs
+            with claw_lock:
+                current_logs = task['logs'][last_index:]
+                if current_logs:
+                    for log in current_logs:
+                        yield f"data: {json.dumps({'type': 'log', 'message': log})}\n\n"
+                    last_index += len(current_logs)
+                # Envoyer la progression
+                progress = task.get('progress', 0)
+                yield f"data: {json.dumps({'type': 'progress', 'value': progress})}\n\n"
+            time.sleep(0.5)
+
+        # Envoyer le résultat final
+        if task['status'] == 'complete' and task.get('result'):
+            yield f"data: {json.dumps({'type': 'complete', 'result': task['result']})}\n\n"
+        elif task['status'] == 'error':
+            yield f"data: {json.dumps({'type': 'error', 'message': task.get('error', 'Erreur inconnue')})}\n\n"
+
+    return Response(generate(), mimetype="text/event-stream")
 
 
 @app.route("/api/claw/export", methods=["POST"])
@@ -1035,7 +1294,7 @@ def claw_diff():
 
 
 # ---------------------------------------------------------------------------
-# HTML Template (Enhanced with version comparison and export)
+# HTML Template (Modified for SSE real-time display)
 # ---------------------------------------------------------------------------
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="fr">
@@ -1298,7 +1557,7 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
 }
 #context-indicator {
   font-size: 11px; color: var(--success);
-  display: flex; align-items: center; gap: 5px;
+  display: none; align-items: center; gap: 5px;
 }
 #context-indicator::before { content: '●'; animation: pulse 2s infinite; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
@@ -1504,7 +1763,7 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
   flex: 1; min-height: 120px;
   background: var(--bg); border: 1px solid var(--border);
   border-radius: 8px; color: var(--text);
-  font-family: 'JetBrains Mono', monospace; font-size: 13px;
+  font-family: 'JetBrains+Mono', monospace; font-size: 13px;
   padding: 12px; resize: vertical; outline: none; transition: border-color .2s;
 }
 #claw-obj:focus { border-color: var(--accent3); }
@@ -1538,7 +1797,7 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
   background: #060a14; border: 1px solid var(--border);
   border-radius: 8px; padding: 14px;
   overflow-y: auto; font-size: 12px; line-height: 1.8;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'JetBrains+Mono', monospace;
 }
 .log-line { padding: 1px 0; }
 .log-info { color: #7dd3fc; }
@@ -1712,11 +1971,13 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
   </div>
 
   <div>
-    <div class="section-label">Contexte / Persona</div>
+    <div class="section-label">Contexte / Persona <span style="color:var(--success); font-size:10px;">(auto)</span></div>
     <div class="field-group">
       <label class="field-label">Comportement de l'IA</label>
-      <textarea id="system-prompt" placeholder="Ex: Tu es un expert Python. Réponds avec des exemples concrets…"></textarea>
-      <button class="btn btn-primary btn-full" onclick="applyContext()">✓ Appliquer le contexte</button>
+      <textarea id="system-prompt" placeholder="Ex: Tu es un expert Python. Réponds avec des exemples concrets…" oninput="debouncedSaveContext()"></textarea>
+      <small style="color:var(--muted); font-size:11px; margin-top:4px;">
+        Sauvegardé automatiquement
+      </small>
     </div>
   </div>
 
@@ -1794,7 +2055,7 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
     <div class="claw-header">
       <h2>🐾 CLAW Engine v3</h2>
       <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-        <span class="badge">Détection auto • Validation syntaxique • Export ZIP • Diff visuel</span>
+        <span class="badge">Détection auto • Validation syntaxique • Export ZIP • Diff visuel • SSE temps réel</span>
         <span class="badge" id="claw-language-badge" style="display:none">Python</span>
       </div>
     </div>
@@ -1824,7 +2085,7 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
       </div>
 
       <div class="claw-card">
-        <label>📜 Journal d'exécution</label>
+        <label>📜 Journal d'exécution (temps réel)</label>
         <div class="claw-progress" id="claw-progress-wrap" style="display:none">
           <div class="claw-progress-bar" id="claw-progress-bar"></div>
         </div>
@@ -1885,6 +2146,8 @@ let clawRunning  = false;
 let clawVersions = [];
 let clawLanguage = '';
 let currentClawVersionIndex = 3;
+let contextSaveTimeout;
+let eventSource = null; // Pour pouvoir fermer la connexion SSE
 
 /* =========================================================
    VIEW SWITCHING
@@ -1910,26 +2173,31 @@ msgInput.addEventListener('keydown', e => {
 });
 
 /* =========================================================
-   CONTEXT
+   CONTEXT AUTO-SAVE
    ========================================================= */
-async function applyContext() {
+function saveContext() {
   const prompt = document.getElementById('system-prompt').value.trim();
-  const model  = document.getElementById('model-select').value;
-  const res = await fetch('/api/context', {
+  const model = document.getElementById('model-select').value;
+
+  fetch('/api/context', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ system_prompt: prompt, model, skills })
-  });
-  if (res.ok) {
+    body: JSON.stringify({ system_prompt: prompt, model: model })
+  }).then(() => {
     hasContext = !!prompt;
     document.getElementById('context-indicator').style.display = hasContext ? 'flex' : 'none';
     document.getElementById('stat-ctx').textContent = hasContext ? 'Oui' : 'Non';
     document.getElementById('model-badge').textContent = model;
-    showToast(hasContext ? '✓ Contexte appliqué' : '✓ Contexte effacé', 'success');
-  } else {
-    showToast('❌ Erreur lors de l\'application', 'error');
-  }
+  }).catch(console.error);
 }
+
+function debouncedSaveContext() {
+  clearTimeout(contextSaveTimeout);
+  contextSaveTimeout = setTimeout(saveContext, 1000);
+}
+
+// Sauvegarde automatique du modèle aussi
+document.getElementById('model-select').addEventListener('change', saveContext);
 
 /* =========================================================
    SKILLS
@@ -2159,7 +2427,7 @@ function removeClawFile(i) {
 }
 
 /* =========================================================
-   CLAW — MAIN LOOP
+   CLAW — SSE REAL-TIME STREAMING
    ========================================================= */
 function clawLog(msg, type = 'info') {
   const logs = document.getElementById('claw-logs');
@@ -2195,21 +2463,88 @@ async function runClaw() {
   clawFiles.forEach(f => fd.append('claw_files', f));
 
   try {
-    const res  = await fetch('/api/claw/process', { method: 'POST', body: fd });
+    // 1. Démarrer la tâche
+    const res = await fetch('/api/claw/process', { method: 'POST', body: fd });
     const data = await res.json();
 
     if (data.error) {
       clawLog('❌ ' + data.error, 'err');
       showToast('❌ Erreur CLAW : ' + data.error, 'error');
+      clawRunning = false;
+      runBtn.disabled = false;
+      runBtn.textContent = '🚀 Lancer la boucle CLAW';
       return;
     }
 
-    // Store versions and language globally
-    clawVersions = data.versions || [];
-    clawLanguage = data.language || 'python';
+    const task_id = data.task_id;
+
+    // Fermer toute connexion SSE précédente
+    if (eventSource) {
+      eventSource.close();
+    }
+
+    // 2. Connecter au stream SSE
+    eventSource = new EventSource(`/api/claw/stream?task_id=${task_id}`);
+
+    eventSource.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === 'log') {
+          // Analyser le type de log pour la coloration
+          let type = 'info';
+          if (!data.message.trim()) { clawLog('', 'dim'); return; }
+          if (data.message.includes('❌')) type = 'err';
+          else if (data.message.includes('✅') || data.message.includes('🎯') || data.message.includes('🏁')) type = 'ok';
+          else if (data.message.includes('⚠️') || data.message.includes('🔄')) type = 'warn';
+          else if (data.message.includes('══')) type = 'phase';
+          else if (data.message.includes('↩️') || data.message.toLowerCase().includes('retry')) type = 'retry';
+          else if (data.message.startsWith('   ')) type = 'dim';
+          clawLog(data.message, type);
+        } else if (data.type === 'progress') {
+          setClawProgress(data.value);
+        } else if (data.type === 'complete') {
+          eventSource.close();
+          handleClawComplete(data.result);
+          clawRunning = false;
+          runBtn.disabled = false;
+          runBtn.textContent = '🚀 Lancer la boucle CLAW';
+        } else if (data.type === 'error') {
+          eventSource.close();
+          clawLog('❌ ' + data.message, 'err');
+          showToast('❌ Erreur tâche: ' + data.message, 'error');
+          clawRunning = false;
+          runBtn.disabled = false;
+          runBtn.textContent = '🚀 Lancer la boucle CLAW';
+        }
+      } catch (e) {
+        console.error('Erreur parsing SSE:', e);
+      }
+    };
+
+    eventSource.onerror = () => {
+      eventSource.close();
+      showToast('❌ Connexion SSE interrompue', 'error');
+      clawRunning = false;
+      runBtn.disabled = false;
+      runBtn.textContent = '🚀 Lancer la boucle CLAW';
+    };
+
+  } catch (e) {
+    clawLog('❌ Erreur réseau : ' + e.message, 'err');
+    showToast('❌ Erreur réseau', 'error');
+    clawRunning = false;
+    runBtn.disabled = false;
+    runBtn.textContent = '🚀 Lancer la boucle CLAW';
+  }
+}
+
+function handleClawComplete(result) {
+  if (result.final_code) {
+    clawVersions = result.versions || [];
+    clawLanguage = result.language || 'python';
     currentClawVersionIndex = clawVersions.length - 1;
 
-    // Update language badge
+    // Mettre à jour le badge langue
     const langBadge = document.getElementById('language-badge');
     const clawLangBadge = document.getElementById('claw-language-badge');
     if (clawLanguage) {
@@ -2219,61 +2554,36 @@ async function runClaw() {
       clawLangBadge.style.display = 'inline-flex';
     }
 
-    // Render logs with richer type detection
-    (data.logs || []).forEach(line => {
-      let type = 'info';
-      if (!line.trim()) { clawLog('', 'dim'); return; }
-      if (line.includes('❌'))            type = 'err';
-      else if (line.includes('✅') || line.includes('🎯') || line.includes('🏁')) type = 'ok';
-      else if (line.includes('⚠️') || line.includes('🔄')) type = 'warn';
-      else if (line.includes('══'))       type = 'phase';
-      else if (line.includes('↩️') || line.includes('retry')) type = 'retry';
-      else if (line.startsWith('   '))    type = 'dim';
-      clawLog(line, type);
+    updateClawCodeDisplay();
+
+    // Afficher les métadonnées
+    const meta = document.getElementById('claw-output-meta');
+    meta.innerHTML = [
+      `Langage : <em>${clawLanguage}</em>`,
+      result.iterations ? `<span>Itérations : <em>${result.iterations}</em></span>` : '',
+      result.char_count ? `<span>Taille : <em>${result.char_count.toLocaleString()} caractères</em></span>` : '',
+      result.validated ? `<span>Syntaxe : <em>✅ valide</em></span>` : `<span>Syntaxe : <em>⚠️ non validée</em></span>`,
+      result.retries > 0 ? `<span>Retentatives : <em>${result.retries}</em></span>` : '',
+      clawVersions.length > 1 ? `<span>Versions : <em>${clawVersions.length}</em></span>` : '',
+    ].filter(Boolean).join('');
+
+    // Mettre à jour le sélecteur de version
+    const versionSelect = document.getElementById('claw-version-select');
+    versionSelect.innerHTML = '';
+    clawVersions.forEach((v, i) => {
+      const option = document.createElement('option');
+      option.value = i;
+      let label = i === 0 ? 'Version initiale' : `Après itération ${i}`;
+      if (i === clawVersions.length - 1) label += ' (finale)';
+      option.textContent = label;
+      versionSelect.appendChild(option);
     });
+    versionSelect.value = currentClawVersionIndex;
 
-    setClawProgress(100);
-
-    if (data.final_code) {
-      updateClawCodeDisplay();
-
-      // Show metadata
-      const meta = document.getElementById('claw-output-meta');
-      meta.innerHTML = [
-        `Langage : <em>${clawLanguage}</em>`,
-        data.iterations  ? `<span>Itérations : <em>${data.iterations}</em></span>` : '',
-        data.char_count  ? `<span>Taille : <em>${data.char_count.toLocaleString()} caractères</em></span>` : '',
-        data.validated   ? `<span>Syntaxe : <em>✅ valide</em></span>` : `<span>Syntaxe : <em>⚠️ non validée</em></span>`,
-        data.retries > 0 ? `<span>Retentatives : <em>${data.retries}</em></span>` : '',
-        clawVersions.length > 1 ? `<span>Versions : <em>${clawVersions.length}</em></span>` : '',
-      ].filter(Boolean).join('');
-
-      // Update version selector
-      const versionSelect = document.getElementById('claw-version-select');
-      versionSelect.innerHTML = '';
-      clawVersions.forEach((v, i) => {
-        const option = document.createElement('option');
-        option.value = i;
-        let label = i === 0 ? 'Version initiale' : `Après itération ${i}`;
-        if (i === clawVersions.length - 1) label += ' (finale)';
-        option.textContent = label;
-        versionSelect.appendChild(option);
-      });
-      versionSelect.value = currentClawVersionIndex;
-
-      document.getElementById('claw-output-area').style.display = 'block';
-      showToast('✅ Boucle CLAW terminée !', 'success');
-    } else {
-      showToast('⚠️ Boucle terminée sans code final', 'warn');
-    }
-
-  } catch (e) {
-    clawLog('❌ Erreur réseau : ' + e.message, 'err');
-    showToast('❌ Erreur réseau', 'error');
-  } finally {
-    clawRunning = false;
-    runBtn.disabled = false;
-    runBtn.textContent = '🚀 Lancer la boucle CLAW';
+    document.getElementById('claw-output-area').style.display = 'block';
+    showToast('✅ Boucle CLAW terminée !', 'success');
+  } else {
+    showToast('⚠️ Boucle terminée sans code final', 'warn');
   }
 }
 
@@ -2347,6 +2657,12 @@ function closeDiffModal() {
 }
 
 function clearClaw() {
+  // Fermer la connexion SSE si elle est ouverte
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
+
   document.getElementById('claw-obj').value = '';
   clawFiles = [];
   renderClawFiles();
@@ -2442,9 +2758,9 @@ document.addEventListener('keydown', e => {
     }
     if (data.system_prompt) {
       document.getElementById('system-prompt').value = data.system_prompt;
+      hasContext = true;
       document.getElementById('context-indicator').style.display = 'flex';
       document.getElementById('stat-ctx').textContent = 'Oui';
-      hasContext = true;
     }
     if (data.skills?.length) {
       skills = data.skills;
@@ -2462,6 +2778,7 @@ document.addEventListener('keydown', e => {
 </body>
 </html>
 """
+
 if __name__ == "__main__":
     logger.info("🚀 AI Chatbot + CLAW v3")
     # Render donne un port dans la variable PORT, sinon on prend 5000 en local
