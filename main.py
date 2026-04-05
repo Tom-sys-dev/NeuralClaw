@@ -10,6 +10,7 @@ from typing import Any
 import os
 import requests
 from flask import Flask, jsonify, render_template_string, request, session
+import threading
 import urllib.parse
 
 # ---------------------------------------------------------------------------
@@ -20,9 +21,39 @@ API_KEY = os.environ.get("OPENROUTER_API_KEY")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "minimax/minimax-m2.5:free"
 
+KEEP_ALIVE_URL = "https://neuralclaw.onrender.com"
+KEEP_ALIVE_INTERVAL = 30  # secondes
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s — %(message)s")
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Keep-Alive Background Thread
+# ---------------------------------------------------------------------------
+def keep_alive_pinger():
+    """Ping le site toutes les 30 secondes pour éviter l'idle timeout."""
+    logger.info(f"🚀 Thread Keep-Alive démarré (ping toutes les {KEEP_ALIVE_INTERVAL}s)")
+    while True:
+        try:
+            response = requests.get(KEEP_ALIVE_URL, timeout=10)
+            logger.info(f"✅ Keep-Alive ping: {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"⚠️ Keep-Alive échoué: {e}")
+        except Exception as e:
+            logger.error(f"❌ Erreur Keep-Alive: {e}")
+        
+        time.sleep(KEEP_ALIVE_INTERVAL)
+
+
+def start_keep_alive_thread():
+    """Démarre le thread de ping en arrière-plan."""
+    ping_thread = threading.Thread(target=keep_alive_pinger, daemon=True)
+    ping_thread.start()
+    logger.info("✅ Thread Keep-Alive lancé")
+
+# ---------------------------------------------------------------------------
+# Flask App
+# ---------------------------------------------------------------------------
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 app.config["MAX_FORM_MEMORY_SIZE"] = 50 * 1024 * 1024
@@ -61,7 +92,7 @@ def _get_session() -> dict[str, Any]:
 def _build_system_content(sess: dict) -> str:
     parts: list[str] = []
     if sess.get("skills"):
-        parts.append(f"Skills and areas of expertise: {', '.join(sess['skills'])}.")
+        parts.append(f"Skillsand areas of expertise: {', '.join(sess['skills'])}.")
     if sess.get("system_prompt"):
         parts.append(sess["system_prompt"])
     return "\n\n".join(parts)
@@ -389,7 +420,7 @@ body {
   width: 300px;
   min-width: 300px;
   background: var(--panel);
-  border-right: 1px solid var(--border);
+  border-right: 1px solidvar(--border);
   display: flex;
   flex-direction: column;
   padding: 24px 20px;
@@ -402,7 +433,7 @@ body {
   font-family: 'Syne', sans-serif;
   font-size: 22px;
   font-weight: 800;
-  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  background: linear-gradient(135deg,var(--accent),var(--accent2));
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
@@ -552,7 +583,7 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
 
 #topbar {
   padding: 14px 24px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solidvar(--border);
   display: flex;
   align-items: center;
   gap: 12px;
@@ -616,7 +647,7 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
   font-size: 16px; flex-shrink: 0; margin-top: 2px;
 }
 .avatar.user { background: var(--user-bg); }
-.avatar.bot  { background: linear-gradient(135deg, var(--accent), var(--accent2)); }
+.avatar.bot  { background: linear-gradient(135deg,var(--accent),var(--accent2)); }
 
 .bubble {
   padding: 14px 18px; border-radius: var(--radius);
@@ -630,7 +661,7 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
 .bubble.bot {
   background: var(--bot-bg);
   border-top-left-radius: 4px;
-  border: 1px solid var(--border);
+  border: 1px solidvar(--border);
 }
 .bubble.bot p { margin-bottom: 10px; }
 .bubble.bot p:last-child { margin-bottom: 0; }
@@ -645,7 +676,7 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
 }
 .bubble.bot pre {
   background: #0d1117; border-radius: 8px; padding: 14px;
-  overflow-x: auto; margin: 10px 0; border: 1px solid var(--border);
+  overflow-x: auto; margin: 10px 0; border: 1px solidvar(--border);
 }
 .bubble.bot pre code { font-size: 12px; }
 .bubble.bot blockquote {
@@ -654,7 +685,7 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
 }
 .bubble.bot table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 12px; }
 .bubble.bot th { background: rgba(59,130,246,.15); padding: 8px 12px; text-align: left; }
-.bubble.bot td { padding: 7px 12px; border-bottom: 1px solid var(--border); }
+.bubble.bot td { padding: 7px 12px; border-bottom: 1px solidvar(--border); }
 
 .msg-time { font-size: 10px; color: var(--muted); margin-top: 5px; padding: 0 4px; }
 
@@ -662,7 +693,7 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
 #typing { display: none; align-self: flex-start; gap: 12px; align-items: center; }
 #typing.visible { display: flex; }
 .typing-dots {
-  background: var(--bot-bg); border: 1px solid var(--border);
+  background: var(--bot-bg); border: 1px solidvar(--border);
   border-radius: var(--radius); border-top-left-radius: 4px;
   padding: 14px 18px; display: flex; gap: 5px; align-items: center;
 }
@@ -687,7 +718,7 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
 /* ── Input area ── */
 #input-area {
   padding: 16px 24px 20px;
-  border-top: 1px solid var(--border);
+  border-top: 1px solidvar(--border);
   display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap;
   flex-shrink: 0;
 }
@@ -696,7 +727,7 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
 }
 #file-attach-area.visible { display: flex; }
 .file-chip {
-  background: var(--bg); border: 1px solid var(--border);
+  background: var(--bg); border: 1px solidvar(--border);
   border-radius: 8px; padding: 6px 10px; font-size: 11px;
   display: flex; align-items: center; gap: 6px; color: var(--accent2);
 }
@@ -709,7 +740,7 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
 #message-input {
   flex: 1; min-height: 50px; max-height: 160px;
   padding: 14px 16px;
-  background: var(--panel); border: 1px solid var(--border);
+  background: var(--panel); border: 1px solidvar(--border);
   border-radius: var(--radius); color: var(--text);
   font-family: 'JetBrains Mono', monospace; font-size: 13.5px;
   resize: none; outline: none; transition: border-color .2s; line-height: 1.5;
@@ -724,7 +755,7 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
 }
 #attach-btn { background: var(--bg); color: var(--muted); }
 #attach-btn:hover { color: var(--accent); transform: scale(1.05); }
-#send-btn { background: linear-gradient(135deg, var(--accent), var(--accent2)); }
+#send-btn { background: linear-gradient(135deg,var(--accent),var(--accent2)); }
 #send-btn:hover:not(:disabled) { transform: scale(1.05); }
 #send-btn:disabled { opacity: .4; cursor: not-allowed; }
 .action-btn svg { width: 20px; height: 20px; fill: currentColor; }
@@ -732,7 +763,7 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
 /* ── Toast ── */
 #toast {
   position: fixed; bottom: 30px; right: 30px;
-  background: var(--panel); border: 1px solid var(--border);
+  background: var(--panel); border: 1px solidvar(--border);
   color: var(--text); padding: 12px 20px; border-radius: 10px;
   font-size: 13px; transform: translateY(80px); opacity: 0;
   transition: all .3s; z-index: 9999; pointer-events: none;
@@ -773,9 +804,9 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
   <div>
     <div class="section-label">Modèle IA</div>
     <select id="model-select">
-      {% for m in models %}
-      <option value="{{ m.id }}" {% if m.id == default_model %}selected{% endif %}>{{ m.label }}</option>
-      {% endfor %}
+      {%for m in models%}
+      <option value="{{ m.id }}" {%if m.id == default_model%}selected{%endif%}>{{ m.label }}</option>
+      {%endfor%}
     </select>
   </div>
 
@@ -954,8 +985,8 @@ function renderSkills() {
 /* =========================================================
    FILE HANDLING
    ========================================================= */
-function handleFileSelect(event) {
-  Array.from(event.target.files).forEach(f => {
+function handleFileSelectevent() {
+  Array.from(event.target.files.forEach(f => {
     if (f.size > 5 * 1024 * 1024) return showToast(`❌ ${f.name} dépasse 5MB`, 'error');
     if (attachedFiles.find(x => x.name === f.name)) return showToast(`❌ ${f.name} déjà ajouté`, 'error');
     attachedFiles.push(f);
@@ -1160,6 +1191,9 @@ document.addEventListener('keydown', e => {
 """
 
 if __name__ == "__main__":
-    logger.info("🚀 NeuralChat — Chat only")
+    # Démarrer le thread keep-alive au lancement
+    start_keep_alive_thread()
+    
+    logger.info("🚀 NeuralChat — Chat only avec Keep-Alive")
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
