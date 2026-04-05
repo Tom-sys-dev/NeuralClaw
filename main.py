@@ -342,6 +342,7 @@ def history():
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="fr">
 <head>
+<meta name="google-site-verification" content="vzCrSu00ltws5LqYzv30DlzzN4GfanP6A_gGuf6TrS0" />
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>NeuralChat</title>
