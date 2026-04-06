@@ -5,7 +5,7 @@ import re
 import logging
 from typing import List, Dict
 import time
-import uuid
+import threading
 from typing import Any
 import os
 import requests
@@ -22,6 +22,10 @@ API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "minimax/minimax-m2.5:free"
+# Configuration du ping keep-alive pour Render
+PING_URL = "https://neuralclaw.onrender.com"
+PING_INTERVAL = 30  # secondes
+
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s — %(message)s")
 logger = logging.getLogger(__name__)
@@ -30,6 +34,38 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 app.config["MAX_FORM_MEMORY_SIZE"] = 50 * 1024 * 1024
 app.secret_key = "change-me-in-production-use-os-urandom"
+_ping_thread_started = False
+
+def ping_site():
+    """Envoie une requête GET à l'URL cible pour maintenir le service en vie."""
+    try:
+        response = requests.get(PING_URL, timeout=10)
+        logger.info(f"[PING] {PING_URL} — statut {response.status_code}")
+    except Exception as e:
+        logger.error(f"[PING] Échec du ping: {e}")
+
+def schedule_ping():
+    """Boucle infinie qui ping le site toutes les 30 secondes."""
+    while True:
+        ping_site()
+        time.sleep(PING_INTERVAL)
+
+def start_ping_thread():
+    """Démarre le thread de ping si activé par la variable d'environnement."""
+    global _ping_thread_started
+    if _ping_thread_started:
+        return
+    enable = os.environ.get("ENABLE_PING", "true").lower() == "true"
+    if enable:
+        thread = threading.Thread(target=schedule_ping, daemon=True)
+        thread.start()
+        logger.info("Thread de ping (keep-alive) démarré — ping toutes les 30 secondes.")
+        _ping_thread_started = True
+    else:
+        logger.info("Thread de ping désactivé (définissez ENABLE_PING=true pour activer).")
+
+# Démarrer le thread au chargement du module (fonctionne avec gunicorn et en développement)
+start_ping_thread()
 
 # ---------------------------------------------------------------------------
 # Base de données
@@ -539,6 +575,8 @@ FREE_MODELS: list[dict[str, str]] = [
     {"id": "meta-llama/llama-3.3-70b-instruct:free", "label": "Llama 3.3 70B"},
     {"id": "stepfun/step-3.5-flash:free", "label": "Step 3.5"},
     {"id": "nvidia/nemotron-3-super-120b-a12b:free", "label": "Nemotron 3"},
+    {"id": "arcee-ai/trinity-large-preview:free", "label": "trinity"},
+
 ]
 
 # ---------------------------------------------------------------------------
