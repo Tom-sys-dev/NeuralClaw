@@ -34,38 +34,7 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 app.config["MAX_FORM_MEMORY_SIZE"] = 50 * 1024 * 1024
 app.secret_key = "change-me-in-production-use-os-urandom"
-_ping_thread_started = False
 
-def ping_site():
-    """Envoie une requête GET à l'URL cible pour maintenir le service en vie."""
-    try:
-        response = requests.get(PING_URL, timeout=10)
-        logger.info(f"[PING] {PING_URL} — statut {response.status_code}")
-    except Exception as e:
-        logger.error(f"[PING] Échec du ping: {e}")
-
-def schedule_ping():
-    """Boucle infinie qui ping le site toutes les 30 secondes."""
-    while True:
-        ping_site()
-        time.sleep(PING_INTERVAL)
-
-def start_ping_thread():
-    """Démarre le thread de ping si activé par la variable d'environnement."""
-    global _ping_thread_started
-    if _ping_thread_started:
-        return
-    enable = os.environ.get("ENABLE_PING", "true").lower() == "true"
-    if enable:
-        thread = threading.Thread(target=schedule_ping, daemon=True)
-        thread.start()
-        logger.info("Thread de ping (keep-alive) démarré — ping toutes les 30 secondes.")
-        _ping_thread_started = True
-    else:
-        logger.info("Thread de ping désactivé (définissez ENABLE_PING=true pour activer).")
-
-# Démarrer le thread au chargement du module (fonctionne avec gunicorn et en développement)
-start_ping_thread()
 
 # ---------------------------------------------------------------------------
 # Base de données
