@@ -4,7 +4,7 @@ import json
 import sqlite3
 from contextlib import closing
 
-from config import DB_PATH, DEFAULT_MODEL, logger
+from config.py import DB_PATH, DEFAULT_MODEL, logger
 
 
 # ---------------------------------------------------------------------------
