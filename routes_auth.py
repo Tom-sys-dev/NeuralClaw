@@ -6,13 +6,13 @@ from contextlib import closing
 from flask import Blueprint, jsonify, redirect, render_template_string, request, session
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from config import logger
-from database import get_db
+from config.py import logger
+from database.py import get_db
 
 auth_bp = Blueprint("auth", __name__)
 
 # Template HTML importé depuis templates/login.html (voir fichier dédié)
-from templates_html import LOGIN_TEMPLATE
+from templates_html.py import LOGIN_TEMPLATE
 
 
 # ---------------------------------------------------------------------------
