@@ -1,0 +1,221 @@
+from __future__ import annotations
+
+import requests
+from flask import Blueprint, jsonify, render_template_string, request, session
+
+from config import DEFAULT_MODEL, FREE_MODELS, OPENROUTER_URL, logger
+from database import save_session_to_db
+from llm import _get_headers, perform_search
+from session_helpers import (
+    LANG_INSTRUCTIONS,
+    build_system_content,
+    estimate_tokens,
+    get_session,
+)
+from templates_html import HTML_TEMPLATE
+
+chat_bp = Blueprint("chat", __name__)
+
+
+# ---------------------------------------------------------------------------
+# Page principale
+# ---------------------------------------------------------------------------
+
+@chat_bp.route("/")
+def index() -> str:
+    return render_template_string(HTML_TEMPLATE, models=FREE_MODELS, default_model=DEFAULT_MODEL)
+
+
+# ---------------------------------------------------------------------------
+# Contexte & skills
+# ---------------------------------------------------------------------------
+
+@chat_bp.route("/api/context", methods=["POST"])
+def set_context():
+    data     = request.get_json(force=True)
+    username = session.get("username", "__anon__")
+    sess     = get_session()
+
+    if "system_prompt" in data:
+        sess["system_prompt"] = data["system_prompt"].strip()
+    if "model" in data:
+        sess["model"] = data["model"]
+    if "skills" in data:
+        sess["skills"] = [s for s in data["skills"] if isinstance(s, str)]
+    if "lang" in data:
+        sess["lang"] = data["lang"]
+
+    if username != "__anon__":
+        save_session_to_db(username, sess)
+
+    return jsonify({"ok": True})
+
+
+@chat_bp.route("/api/skills", methods=["POST"])
+def set_skills():
+    data     = request.get_json(force=True)
+    username = session.get("username", "__anon__")
+    sess     = get_session()
+    sess["skills"] = [s for s in data.get("skills", []) if isinstance(s, str)]
+
+    if username != "__anon__":
+        save_session_to_db(username, sess)
+
+    return jsonify({"ok": True, "skills": sess["skills"]})
+
+
+# ---------------------------------------------------------------------------
+# Chat
+# ---------------------------------------------------------------------------
+
+@chat_bp.route("/api/chat", methods=["POST"])
+def chat():
+    username = session.get("username", "__anon__")
+    sess     = get_session()
+
+    # ── Récupération du message ──────────────────────────────────────────
+    if request.is_json:
+        data     = request.get_json()
+        user_msg = data.get("message", "").strip()
+    else:
+        data     = None
+        user_msg = request.form.get("message", "").strip()
+
+    # ── Fichiers joints ──────────────────────────────────────────────────
+    file_parts: list[str] = []
+    for f in request.files.getlist("files"):
+        if f.filename:
+            try:
+                content = f.read().decode("utf-8", errors="replace")
+                file_parts.append(f"--- Fichier joint : {f.filename} ---\n{content}")
+            except Exception as exc:
+                logger.warning("Erreur lecture fichier %s : %s", f.filename, exc)
+
+    full_msg = user_msg
+    if file_parts:
+        full_msg += "\n\n" + "\n\n".join(file_parts)
+
+    if not full_msg:
+        return jsonify({"error": "Message vide"}), 400
+
+    # ── Langue ───────────────────────────────────────────────────────────
+    # BUG FIX : `data` peut être None si la requête n'est pas JSON
+    lang = (data.get("lang") if data else None) or request.form.get("lang")
+    if lang:
+        sess["lang"] = lang
+        if username != "__anon__":
+            save_session_to_db(username, sess)
+    selected_lang = sess.get("lang", "fr")
+    lang_rule     = LANG_INSTRUCTIONS.get(selected_lang, LANG_INSTRUCTIONS["fr"])
+
+    # ── Construction du prompt système ──────────────────────────────────
+    sys_content   = build_system_content(sess)
+    tool_block    = (
+        "\n\nOUTILS DISPONIBLES:\n"
+        "Tu as accès à un outil de recherche internet. Pour l'utiliser, "
+        "tape exactement: \\recherche <ta question>\n"
+        "Utilise cet outil pour les questions factuelles ou qui nécessitent des informations à jour."
+    )
+    lang_block    = f"\n\nRÈGLE ABSOLUE DE LANGUE: {lang_rule}"
+    full_sys      = (sys_content + tool_block + lang_block) if sys_content else (tool_block.strip() + lang_block)
+
+    # ── Boucle d'appel avec recherche ───────────────────────────────────
+    sess["messages"].append({"role": "user", "content": full_msg})
+    payload_messages = [{"role": "system", "content": full_sys}]
+    payload_messages.extend(sess["messages"])
+
+    max_search_attempts = 5
+    search_count        = 0
+    final_reply         = None
+
+    while search_count < max_search_attempts:
+        payload = {
+            "model":      sess["model"],
+            "messages":   payload_messages,
+            "max_tokens": 80000,
+        }
+        try:
+            response = requests.post(
+                OPENROUTER_URL, headers=_get_headers(), json=payload, timeout=90
+            )
+            result = response.json()
+        except requests.RequestException as exc:
+            logger.error("OpenRouter error: %s", exc)
+            sess["messages"].pop()
+            return jsonify({"error": "Problème de connexion au service AI"}), 502
+
+        if "error" in result:
+            err = result["error"]
+            sess["messages"].pop()
+            return jsonify({
+                "error": f"IA indisponible ({err.get('code', '?')}): {err.get('message', '')}"
+            }), 502
+
+        reply: str = result["choices"][0]["message"]["content"]
+
+        if reply.strip().startswith("\\recherche "):
+            search_count += 1
+            query = reply.strip()[len("\\recherche "):].strip()
+
+            if not query:
+                # BUG FIX : éviter une boucle infinie si la requête est vide
+                final_reply = reply
+                payload_messages.append({"role": "assistant", "content": reply})
+                break
+
+            search_results = perform_search(query)
+            payload_messages.append({"role": "assistant", "content": reply})
+            payload_messages.append({
+                "role": "system",
+                "content": (
+                    f"RÉSULTATS DE RECHERCHE pour « {query} »:\n{search_results}\n\n"
+                    "Rédige maintenant ta réponse finale basée sur ces résultats."
+                ),
+            })
+        else:
+            final_reply = reply
+            payload_messages.append({"role": "assistant", "content": reply})
+            break
+
+    if final_reply is None:
+        return jsonify({"reply": "Limite de recherches atteinte. Réessaie."})
+
+    sess["messages"] = [m for m in payload_messages if m["role"] in ("user", "assistant")]
+
+    if username != "__anon__":
+        save_session_to_db(username, sess)
+
+    return jsonify({
+        "reply":            final_reply,
+        "total_messages":   len(sess["messages"]),
+        "estimated_tokens": estimate_tokens(sess["messages"]),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Clear & historique
+# ---------------------------------------------------------------------------
+
+@chat_bp.route("/api/clear", methods=["POST"])
+def clear():
+    username = session.get("username", "__anon__")
+    sess     = get_session()
+    sess["messages"] = []
+
+    if username != "__anon__":
+        save_session_to_db(username, sess)
+
+    return jsonify({"ok": True})
+
+
+@chat_bp.route("/api/history", methods=["GET"])
+def history():
+    sess = get_session()
+    return jsonify({
+        "messages":         sess["messages"],
+        "system_prompt":    sess["system_prompt"],
+        "model":            sess["model"],
+        "skills":           sess.get("skills", []),
+        "lang":             sess.get("lang", "fr"),
+        "estimated_tokens": estimate_tokens(sess["messages"]),
+    })
