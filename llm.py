@@ -6,7 +6,7 @@ from typing import List, Dict
 
 import requests
 
-from config import API_KEY, OPENROUTER_URL, DEFAULT_MODEL, logger
+from config.py import API_KEY, OPENROUTER_URL, DEFAULT_MODEL, logger
 
 
 # ---------------------------------------------------------------------------
