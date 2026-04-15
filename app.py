@@ -20,11 +20,11 @@ import os
 
 from flask import Flask
 
-from config import logger
-from database import init_db
-from routes_auth import auth_bp
-from routes_chat import chat_bp
-from routes_warroom import warroom_bp
+from config.py import logger
+from database.py import init_db
+from routes_auth.py import auth_bp
+from routes_chat.py import chat_bp
+from routes_warroom.py import warroom_bp
 
 # ---------------------------------------------------------------------------
 # Création de l'application Flask
