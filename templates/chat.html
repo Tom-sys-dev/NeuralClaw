@@ -1,0 +1,2132 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>NeuralChat</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/tokyo-night-dark.min.css"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+<style>
+:root {
+  --bg:      #0a0e1a;
+  --panel:   #111827;
+  --border:  #1e2d45;
+  --accent:  #3b82f6;
+  --accent2: #06b6d4;
+  --accent3: #8b5cf6;
+  --user-bg: #1d3461;
+  --bot-bg:  #131f35;
+  --text:    #e2e8f0;
+  --muted:   #64748b;
+  --danger:  #ef4444;
+  --success: #22c55e;
+  --warn:    #f59e0b;
+  --war:     #f97316;
+  --radius:  12px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'JetBrains Mono', monospace; background: var(--bg); color: var(--text); height: 100vh; display: flex; overflow: hidden; }
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* ── Sidebar ── */
+#sidebar {
+  width: 300px; min-width: 300px; background: var(--panel);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; padding: 24px 20px; gap: 20px;
+  overflow-y: auto; transition: transform 0.3s ease;
+}
+#sidebar h1 {
+  font-family: 'Syne', sans-serif; font-size: 22px; font-weight: 800;
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  background-clip: text; letter-spacing: -0.5px;
+}
+#sidebar h1 span { display: block; font-size: 11px; font-weight: 400; color: var(--muted); margin-top: 2px; -webkit-text-fill-color: var(--muted); }
+.section-label { font-size: 10px; font-weight: 600; letter-spacing: 1.5px; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+.field-group { display: flex; flex-direction: column; gap: 8px; }
+label.field-label { font-size: 12px; color: var(--muted); }
+select, textarea, input[type="text"] {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  color: var(--text); font-family: 'JetBrains Mono', monospace;
+  font-size: 12px; padding: 10px 12px; width: 100%;
+  transition: border-color 0.2s; outline: none; resize: none;
+}
+select:focus, textarea:focus, input:focus { border-color: var(--accent); }
+#system-prompt { min-height: 110px; line-height: 1.6; }
+.btn {
+  display: flex; align-items: center; justify-content: center;
+  gap: 8px; padding: 10px 16px; border-radius: 8px; border: none;
+  cursor: pointer; font-family: 'Syne', sans-serif; font-weight: 600;
+  font-size: 13px; transition: all 0.2s;
+}
+.btn-secondary { background: var(--accent3); color: #fff; }
+.btn-secondary:hover { background: #7c3aed; }
+.btn-danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
+.btn-danger:hover { background: rgba(239,68,68,.1); }
+.btn-ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+.btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+.btn-war { background: linear-gradient(135deg, #dc2626, var(--war)); color: #fff; }
+.btn-war:hover { opacity: 0.9; transform: scale(1.02); }
+.btn-advocate { background: linear-gradient(135deg, #7c3aed, #dc2626); color: #fff; }
+.btn-advocate:hover { opacity: 0.9; }
+.btn-full { width: 100%; }
+#stats { font-size: 11px; color: var(--muted); padding: 12px; background: var(--bg); border-radius: 8px; border: 1px solid var(--border); line-height: 2; }
+#stats span { color: var(--accent2); }
+.skills-list { max-height: 150px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+.skill-tag { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; font-size: 12px; animation: fadeIn .3s ease; }
+@keyframes fadeIn { from { opacity:0; transform: translateX(-10px); } to { opacity:1; } }
+.skill-tag .skill-name { color: var(--accent2); font-weight: 500; }
+.skill-tag .skill-remove { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 14px; padding: 2px 6px; border-radius: 4px; transition: all .2s; }
+.skill-tag .skill-remove:hover { color: var(--danger); background: rgba(239,68,68,.1); }
+
+/* ── Modals ── */
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.75); display: flex; align-items: center; justify-content: center; z-index: 1000; opacity: 0; visibility: hidden; transition: all .3s; }
+.modal-overlay.active { opacity: 1; visibility: visible; }
+.modal { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 24px; width: 90%; max-width: 420px; transform: scale(.9); transition: transform .3s; }
+.modal-overlay.active .modal { transform: scale(1); }
+.modal h2 { font-family: 'Syne', sans-serif; font-size: 18px; margin-bottom: 16px; }
+.modal-input { width: 100%; padding: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-family: 'JetBrains Mono', monospace; font-size: 13px; margin-bottom: 16px; outline: none; }
+.modal-input:focus { border-color: var(--accent3); }
+.modal-buttons { display: flex; gap: 10px; justify-content: flex-end; }
+
+/* ── WAR ROOM MODAL ── */
+#warroom-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.9);
+  z-index: 2000; opacity: 0; visibility: hidden; transition: all .3s;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+#warroom-overlay.active { opacity: 1; visibility: visible; }
+#warroom-header {
+  padding: 20px 30px; border-bottom: 1px solid rgba(249,115,22,.3);
+  display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+  background: linear-gradient(90deg, rgba(220,38,38,.05), rgba(249,115,22,.05));
+}
+#warroom-header h2 {
+  font-family: 'Syne', sans-serif; font-size: 20px; font-weight: 800;
+  background: linear-gradient(135deg, #dc2626, var(--war));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+#warroom-close {
+  background: none; border: 1px solid rgba(249,115,22,.4); border-radius: 8px;
+  color: var(--war); padding: 6px 12px; cursor: pointer; font-size: 13px;
+  transition: all .2s; font-family: 'Syne', sans-serif; font-weight: 600;
+}
+#warroom-close:hover { background: rgba(249,115,22,.1); }
+#warroom-body { flex: 1; overflow-y: auto; padding: 24px 30px; display: flex; flex-direction: column; gap: 24px; }
+
+/* Progress bar */
+#warroom-progress { display: flex; align-items: center; gap: 0; }
+.progress-step {
+  flex: 1; text-align: center; padding: 12px 8px; font-size: 11px;
+  font-family: 'Syne', sans-serif; font-weight: 600; letter-spacing: 0.5px;
+  border: 1px solid var(--border); color: var(--muted);
+  position: relative; transition: all .4s;
+}
+.progress-step:first-child { border-radius: 8px 0 0 8px; }
+.progress-step:last-child  { border-radius: 0 8px 8px 0; }
+.progress-step.active  { background: rgba(249,115,22,.15); border-color: var(--war); color: var(--war); }
+.progress-step.done    { background: rgba(34,197,94,.1); border-color: var(--success); color: var(--success); }
+
+/* Expert cards */
+#experts-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.expert-card {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 12px;
+  padding: 16px; text-align: center; transition: all .4s;
+}
+.expert-card.thinking {
+  border-color: var(--war);
+  box-shadow: 0 0 20px rgba(249,115,22,.2);
+  animation: expertPulse 1.5s ease-in-out infinite;
+}
+.expert-card.done {
+  border-color: var(--success);
+  box-shadow: 0 0 12px rgba(34,197,94,.15);
+  animation: none;
+}
+@keyframes expertPulse {
+  0%,100% { box-shadow: 0 0 10px rgba(249,115,22,.2); }
+  50%      { box-shadow: 0 0 30px rgba(249,115,22,.5); }
+}
+.expert-emoji {
+  font-size: 36px; display: block; margin-bottom: 10px;
+  filter: grayscale(1); transition: filter .4s;
+}
+.expert-card.thinking .expert-emoji { filter: none; animation: spin 3s linear infinite; }
+.expert-card.done .expert-emoji { filter: none; animation: none; }
+@keyframes spin { 0%,100% { transform: scale(1); } 50% { transform: scale(1.2); } }
+.expert-role { font-family: 'Syne', sans-serif; font-size: 12px; font-weight: 700; color: var(--text); margin-bottom: 4px; }
+.expert-specialty { font-size: 10px; color: var(--muted); line-height: 1.4; }
+.expert-status { font-size: 10px; margin-top: 8px; padding: 3px 8px; border-radius: 20px; display: inline-block; }
+.expert-status.thinking { background: rgba(249,115,22,.15); color: var(--war); }
+.expert-status.done     { background: rgba(34,197,94,.15); color: var(--success); }
+.expert-status.waiting  { background: rgba(100,116,139,.1); color: var(--muted); }
+
+/* Thought trace */
+#thought-trace {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 12px;
+  padding: 16px; max-height: 180px; overflow-y: auto;
+}
+#thought-trace h3 { font-family: 'Syne', sans-serif; font-size: 12px; font-weight: 700; color: var(--muted); margin-bottom: 10px; letter-spacing: 1px; text-transform: uppercase; }
+.thought-line { font-size: 11px; color: var(--muted); padding: 4px 0; border-bottom: 1px solid rgba(30,45,69,.5); display: flex; gap: 8px; align-items: baseline; }
+.thought-line:last-child { border-bottom: none; }
+.thought-line .tl-time { color: #334155; flex-shrink: 0; }
+.thought-line .tl-text { color: var(--text); }
+.thought-line.highlight .tl-text { color: var(--war); }
+
+/* Proposals tabs */
+#proposals-section h3 { font-family: 'Syne', sans-serif; font-size: 14px; font-weight: 700; color: var(--text); margin-bottom: 12px; }
+.proposal-tabs { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+.ptab { padding: 6px 14px; border-radius: 20px; border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 12px; cursor: pointer; transition: all .2s; font-family: 'JetBrains Mono', monospace; }
+.ptab.active { background: rgba(249,115,22,.15); border-color: var(--war); color: var(--war); }
+.proposal-content { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 16px; font-size: 13px; line-height: 1.7; display: none; }
+.proposal-content.active { display: block; }
+.proposal-content h1,.proposal-content h2,.proposal-content h3 { font-family: 'Syne', sans-serif; margin: 10px 0 6px; }
+.proposal-content ul,.proposal-content ol { padding-left: 18px; margin: 8px 0; }
+.proposal-content li { margin-bottom: 4px; }
+.proposal-content strong { color: #fff; }
+.proposal-content code { background: rgba(59,130,246,.15); color: var(--accent2); padding: 2px 6px; border-radius: 4px; font-size: 11px; }
+
+/* Synthesis */
+#synthesis-section { background: linear-gradient(135deg, rgba(220,38,38,.05), rgba(249,115,22,.05)); border: 1px solid rgba(249,115,22,.3); border-radius: 12px; padding: 20px; }
+#synthesis-section h3 { font-family: 'Syne', sans-serif; font-size: 16px; font-weight: 800; color: var(--war); margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+#synthesis-content { font-size: 13px; line-height: 1.8; color: var(--text); }
+#synthesis-content h1,#synthesis-content h2,#synthesis-content h3 { font-family: 'Syne', sans-serif; margin: 12px 0 8px; color: #fff; }
+#synthesis-content ul,#synthesis-content ol { padding-left: 18px; margin: 8px 0; }
+#synthesis-content li { margin-bottom: 5px; }
+#synthesis-content strong { color: #fff; }
+#synthesis-content blockquote { border-left: 3px solid var(--war); padding-left: 12px; color: var(--muted); margin: 8px 0; }
+.synthesis-actions { display: flex; gap: 10px; margin-top: 16px; }
+
+/* ── ADVOCATE MODAL ── */
+#advocate-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.88);
+  z-index: 2000; opacity: 0; visibility: hidden; transition: all .3s;
+  display: flex; align-items: center; justify-content: center;
+}
+#advocate-overlay.active { opacity: 1; visibility: visible; }
+#advocate-modal {
+  background: var(--panel); border: 1px solid rgba(139,92,246,.4);
+  border-radius: 20px; width: 90%; max-width: 700px; max-height: 88vh;
+  display: flex; flex-direction: column; overflow: hidden;
+  box-shadow: 0 0 60px rgba(139,92,246,.2);
+}
+#advocate-header {
+  padding: 20px 24px; border-bottom: 1px solid rgba(139,92,246,.3);
+  display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+}
+#advocate-header h2 { font-family: 'Syne', sans-serif; font-size: 18px; font-weight: 800; }
+#advocate-body { flex: 1; overflow-y: auto; padding: 20px 24px; }
+#advocate-input-area { padding: 16px 24px; border-top: 1px solid var(--border); display: flex; gap: 10px; flex-shrink: 0; }
+#advocate-input-area textarea { flex: 1; min-height: 50px; max-height: 100px; padding: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; color: var(--text); font-family: 'JetBrains Mono', monospace; font-size: 13px; resize: none; outline: none; }
+#advocate-input-area textarea:focus { border-color: var(--accent3); }
+.critique-content { font-size: 13px; line-height: 1.8; }
+.critique-content h1,.critique-content h2,.critique-content h3 { font-family: 'Syne', sans-serif; margin: 14px 0 8px; color: #fff; }
+.critique-content ul,.critique-content ol { padding-left: 18px; margin: 8px 0; }
+.critique-content li { margin-bottom: 5px; }
+.critique-content strong { color: #fff; }
+
+
+
+/* ── WAR ROOM mode buttons ── */
+.wr-mode-btn.active { background: rgba(249,115,22,.2) !important; color: var(--war) !important; }
+
+/* ── Files chips ── */
+.wr-file-chip {
+  display:flex; align-items:center; gap:6px;
+  padding:5px 10px; border-radius:8px;
+  border:1px solid var(--border); background:var(--bg);
+  font-size:11px; cursor:pointer; transition:all .2s;
+  font-family:'JetBrains Mono',monospace;
+}
+.wr-file-chip:hover { border-color:rgba(74,222,128,.4); }
+.wr-file-chip.valid { border-color:rgba(34,197,94,.3); color:#4ade80; }
+.wr-file-chip.invalid { border-color:rgba(239,68,68,.3); color:var(--danger); }
+.wr-file-chip .fc-lang { font-size:9px; color:var(--muted); }
+.wr-file-chip .fc-lines { font-size:9px; color:var(--muted); }
+
+/* ── Star feedback ── */
+.wr-star {
+  background:none; border:none; font-size:22px; cursor:pointer;
+  opacity:.35; transition:all .15s; padding:2px;
+}
+.wr-star.active, .wr-star:hover { opacity:1; transform:scale(1.15); }
+
+/* ── Spinner in warroom buttons ── */
+#wr-launch-btn .spinner, #wr-refine-btn .spinner {
+  width:12px;height:12px;border:2px solid rgba(255,255,255,.3);
+  border-top-color:#fff;border-radius:50%;animation:spin2 .8s linear infinite;
+  display:inline-block;vertical-align:middle;
+}
+@keyframes spin2 { to { transform:rotate(360deg); } }
+  background: none; border: 1px solid var(--border); border-radius: 8px;
+  color: var(--muted); padding: 6px 12px; cursor: pointer; font-size: 13px;
+  transition: all .2s; font-family: 'Syne', sans-serif; font-weight: 600;
+}
+.modal-close-btn:hover { border-color: var(--text); color: var(--text); }
+
+/* ── Special toolbar buttons ── */
+.special-tools {
+  display: flex; gap: 6px; flex-wrap: wrap; padding: 8px 24px 0;
+  border-top: 1px solid var(--border);
+}
+.tool-btn {
+  padding: 6px 12px; border-radius: 8px; border: 1px solid var(--border);
+  background: transparent; color: var(--muted); font-size: 11px;
+  cursor: pointer; transition: all .2s; font-family: 'Syne', sans-serif;
+  font-weight: 600; display: flex; align-items: center; gap: 5px; white-space: nowrap;
+}
+.tool-btn:hover { transform: translateY(-1px); }
+.tool-btn.war     { border-color: rgba(249,115,22,.5); color: var(--war); }
+.tool-btn.war:hover { background: rgba(249,115,22,.1); }
+.tool-btn.devil   { border-color: rgba(139,92,246,.5); color: var(--accent3); }
+.tool-btn.devil:hover { background: rgba(139,92,246,.1); }
+
+/* ── Expert selector chips ── */
+.expert-chip {
+  padding: 5px 12px; border-radius: 20px;
+  border: 1px solid var(--border); background: transparent;
+  color: var(--muted); font-size: 11px; cursor: pointer;
+  transition: all .2s; font-family: 'Syne', sans-serif; font-weight: 600;
+}
+.expert-chip:hover { border-color: rgba(249,115,22,.5); color: var(--text); }
+.expert-chip.selected {
+  background: rgba(249,115,22,.15);
+  border-color: rgba(249,115,22,.7);
+  color: var(--war);
+}
+
+/* ── Expert Catalog (War Room) ── */
+#expert-catalog { display: flex; flex-direction: column; gap: 10px; }
+.family-group {}
+.family-header {
+  display: flex; align-items: center; gap: 8px;
+  font-family: 'Syne', sans-serif; font-size: 11px; font-weight: 700;
+  letter-spacing: 1px; text-transform: uppercase; padding: 6px 0;
+  cursor: pointer; user-select: none; border-bottom: 1px solid var(--border);
+  margin-bottom: 8px; transition: color .2s;
+}
+.family-header:hover { color: var(--text); }
+.family-toggle { margin-left: auto; font-size: 10px; color: var(--muted); transition: transform .25s; }
+.family-group.collapsed .family-toggle { transform: rotate(-90deg); }
+.family-group.collapsed .family-cards { display: none; }
+.family-cards { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 4px; }
+
+/* Draggable expert mini-card */
+.expert-mini-card {
+  display: flex; flex-direction: column; gap: 3px;
+  width: 140px; padding: 10px 12px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+  cursor: grab; transition: all .2s; user-select: none;
+  position: relative;
+}
+.expert-mini-card:hover { border-color: rgba(249,115,22,.5); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,.3); }
+.expert-mini-card:active { cursor: grabbing; transform: scale(.96); }
+.expert-mini-card.dragging { opacity: .4; border-color: var(--war); }
+.expert-mini-card .emc-top { display: flex; align-items: center; gap: 6px; }
+.expert-mini-card .emc-emoji { font-size: 18px; }
+.expert-mini-card .emc-role { font-family: 'Syne', sans-serif; font-size: 11px; font-weight: 700; color: var(--text); line-height: 1.2; }
+.expert-mini-card .emc-desc { font-size: 10px; color: var(--muted); line-height: 1.3; }
+.expert-mini-card .emc-detail-btn {
+  position: absolute; top: 5px; right: 6px;
+  background: none; border: none; color: var(--muted); font-size: 12px;
+  cursor: pointer; padding: 2px 4px; border-radius: 4px; transition: all .15s;
+  line-height: 1;
+}
+.expert-mini-card .emc-detail-btn:hover { color: var(--accent2); background: rgba(6,182,212,.1); }
+
+/* Drop zone */
+#expert-drop-zone {
+  min-height: 80px; border: 2px dashed rgba(249,115,22,.35); border-radius: 12px;
+  padding: 12px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  transition: all .25s; background: rgba(249,115,22,.03);
+  position: relative;
+}
+#expert-drop-zone.drag-over { border-color: var(--war); background: rgba(249,115,22,.1); box-shadow: 0 0 20px rgba(249,115,22,.2); }
+#expert-drop-zone.full { border-color: var(--success); background: rgba(34,197,94,.04); }
+#drop-placeholder {
+  color: var(--muted); font-size: 11px; text-align: center;
+  width: 100%; pointer-events: none;
+}
+
+/* Selected expert slot */
+.expert-slot {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; background: rgba(249,115,22,.12);
+  border: 1px solid rgba(249,115,22,.5); border-radius: 8px;
+  font-size: 11px; font-family: 'Syne', sans-serif; font-weight: 600; color: var(--war);
+  animation: slotIn .2s ease;
+}
+@keyframes slotIn { from { opacity: 0; transform: scale(.8); } to { opacity: 1; transform: scale(1); } }
+.expert-slot .slot-remove {
+  background: none; border: none; color: var(--muted); cursor: pointer;
+  font-size: 13px; padding: 0 2px; margin-left: 4px; border-radius: 4px;
+  transition: color .15s; line-height: 1;
+}
+.expert-slot .slot-remove:hover { color: var(--danger); }
+
+/* Expert detail modal */
+#expert-detail-modal {
+  position: fixed; inset: 0; z-index: 3000;
+  background: rgba(0,0,0,.75); display: flex; align-items: center; justify-content: center;
+  opacity: 0; visibility: hidden; transition: all .2s;
+}
+#expert-detail-modal.active { opacity: 1; visibility: visible; }
+#expert-detail-box {
+  background: var(--panel); border: 1px solid rgba(249,115,22,.4); border-radius: 16px;
+  padding: 28px 28px 24px; width: 90%; max-width: 420px;
+  transform: scale(.9); transition: transform .2s;
+}
+#expert-detail-modal.active #expert-detail-box { transform: scale(1); }
+#expert-detail-box .edb-emoji { font-size: 42px; display: block; margin-bottom: 10px; }
+#expert-detail-box .edb-role { font-family: 'Syne', sans-serif; font-size: 18px; font-weight: 800; margin-bottom: 4px; }
+#expert-detail-box .edb-family { font-size: 11px; color: var(--muted); margin-bottom: 14px; letter-spacing: .5px; }
+#expert-detail-box .edb-specialty { font-size: 13px; color: var(--text); line-height: 1.7; margin-bottom: 20px; }
+#expert-detail-box .edb-actions { display: flex; gap: 10px; }
+#expert-detail-box .edb-add { flex: 1; padding: 10px; border: none; border-radius: 8px; background: linear-gradient(135deg,#dc2626,var(--war)); color:#fff; font-family:'Syne',sans-serif; font-weight:700; font-size:13px; cursor:pointer; transition:opacity .2s; }
+#expert-detail-box .edb-add:disabled { opacity: .4; cursor: not-allowed; }
+#expert-detail-box .edb-close { padding: 10px 16px; border: 1px solid var(--border); border-radius: 8px; background: transparent; color: var(--muted); font-family:'Syne',sans-serif; font-weight:600; font-size:13px; cursor:pointer; transition:all .2s; }
+#expert-detail-box .edb-close:hover { border-color: var(--accent); color: var(--accent); }
+
+
+/* ── Language selector ── */
+#lang-select {
+  padding: 5px 10px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--text);
+  font-family: 'JetBrains Mono', monospace; font-size: 11px; outline: none; cursor: pointer;
+  transition: border-color .2s;
+}
+#lang-select:hover, #lang-select:focus { border-color: var(--accent2); }
+
+/* ── Chef de Projet card (War Room) ── */
+#pm-section {
+  background: linear-gradient(135deg, rgba(6,182,212,.06), rgba(59,130,246,.06));
+  border: 1px solid rgba(6,182,212,.35); border-radius: 12px; padding: 16px;
+  margin-bottom: 4px;
+}
+#pm-section h3 { font-family: 'Syne', sans-serif; font-size: 13px; font-weight: 700; color: var(--accent2); margin-bottom: 10px; display:flex; align-items:center; gap:6px; }
+.pm-objective { font-size: 13px; color: var(--text); margin-bottom: 10px; line-height: 1.6; }
+.pm-steps { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.pm-step { display: flex; align-items:center; gap: 8px; font-size: 12px; background: rgba(0,0,0,.2); border-radius: 8px; padding: 6px 10px; }
+.pm-step .step-num { background: var(--accent2); color: #000; border-radius: 50%; width: 18px; height: 18px; display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:700; flex-shrink:0; }
+.pm-step .step-prio { font-size: 10px; padding: 2px 6px; border-radius: 10px; flex-shrink:0; }
+.pm-step .step-prio.haute   { background: rgba(239,68,68,.2); color: #f87171; }
+.pm-step .step-prio.moyenne { background: rgba(245,158,11,.2); color: #fbbf24; }
+.pm-step .step-prio.basse   { background: rgba(34,197,94,.2); color: #4ade80; }
+.pm-step .step-dur { color: var(--muted); font-size: 10px; margin-left: auto; }
+.pm-risks { display:flex; gap:6px; flex-wrap:wrap; }
+.pm-risk-tag { font-size: 10px; padding: 3px 8px; border-radius: 10px; background: rgba(239,68,68,.1); border: 1px solid rgba(239,68,68,.3); color: #f87171; }
+
+/* ── User menu ── */
+.user-menu-wrapper { position: relative; }
+.user-avatar-btn {
+  display: flex; align-items: center; gap: 8px;
+  background: rgba(59,130,246,.1); border: 1px solid rgba(59,130,246,.3);
+  border-radius: 10px; padding: 6px 12px; cursor: pointer; transition: all .2s;
+  font-size: 12px; color: var(--accent); font-family: 'JetBrains Mono', monospace;
+  outline: none;
+}
+.user-avatar-btn:hover { background: rgba(59,130,246,.2); }
+.avatar-circle {
+  width: 26px; height: 26px; border-radius: 8px;
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700; color: #fff; font-family: 'Syne', sans-serif;
+}
+.user-dropdown {
+  position: absolute; top: calc(100% + 8px); right: 0;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 12px; padding: 8px; min-width: 210px;
+  box-shadow: 0 12px 40px rgba(0,0,0,.5); z-index: 200;
+  opacity: 0; visibility: hidden; transform: translateY(-6px); transition: all .2s;
+}
+.user-dropdown.open { opacity: 1; visibility: visible; transform: none; }
+.user-dropdown-header { padding: 10px 12px 14px; border-bottom: 1px solid var(--border); margin-bottom: 8px; }
+.user-dropdown-header .uname { font-family: 'Syne', sans-serif; font-weight: 700; font-size: 14px; color: var(--text); }
+.user-dropdown-header .uemail { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.dropdown-item {
+  display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+  border-radius: 8px; cursor: pointer; font-size: 12px; color: var(--muted);
+  transition: all .2s; border: none; background: none; width: 100%; text-align: left;
+}
+.dropdown-item:hover { background: rgba(255,255,255,.05); color: var(--text); }
+.dropdown-item.danger { color: var(--danger); }
+.dropdown-item.danger:hover { background: rgba(239,68,68,.1); }
+
+.login-btn-topbar {
+  display: flex; align-items: center; gap: 6px; padding: 7px 14px;
+  border-radius: 10px; border: 1px solid var(--border); background: transparent;
+  color: var(--muted); font-family: 'Syne', sans-serif;
+  font-size: 12px; font-weight: 600; cursor: pointer; transition: all .2s;
+}
+.login-btn-topbar:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ── Layout ── */
+#app-wrapper { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+#topbar { padding: 12px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+#topbar-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+#model-badge { font-size: 11px; padding: 4px 10px; border-radius: 20px; background: rgba(59,130,246,.15); color: var(--accent); border: 1px solid rgba(59,130,246,.3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
+#context-indicator { font-size: 11px; color: var(--success); display: none; align-items: center; gap: 5px; }
+#context-indicator::before { content: '●'; animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+#skills-indicator { font-size: 11px; color: var(--accent3); display: none; align-items: center; gap: 5px; }
+#sidebar-toggle { display: none; background: none; border: none; cursor: pointer; color: var(--text); padding: 4px; font-size: 18px; }
+
+/* ── Messages ── */
+#messages { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 20px; scroll-behavior: smooth; }
+.msg-wrapper { display: flex; gap: 12px; max-width: 85%; animation: slideIn .25s ease; }
+@keyframes slideIn { from { opacity:0; transform: translateY(8px); } to { opacity:1; } }
+.msg-wrapper.user { flex-direction: row-reverse; align-self: flex-end; }
+.msg-wrapper.bot  { align-self: flex-start; }
+.avatar { width: 34px; height: 34px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 16px; flex-shrink: 0; margin-top: 2px; }
+.avatar.user { background: var(--user-bg); }
+.avatar.bot  { background: linear-gradient(135deg, var(--accent), var(--accent2)); }
+.bubble { padding: 14px 18px; border-radius: var(--radius); font-size: 13.5px; line-height: 1.7; max-width: 100%; }
+.bubble.user { background: var(--user-bg); border-top-right-radius: 4px; color: #c7d9f8; }
+.bubble.bot  { background: var(--bot-bg); border-top-left-radius: 4px; border: 1px solid var(--border); }
+.bubble.bot p { margin-bottom: 10px; }
+.bubble.bot p:last-child { margin-bottom: 0; }
+.bubble.bot h1,.bubble.bot h2,.bubble.bot h3 { font-family: 'Syne', sans-serif; margin: 14px 0 8px; color: #fff; }
+.bubble.bot ul,.bubble.bot ol { padding-left: 20px; margin: 8px 0; }
+.bubble.bot li { margin-bottom: 4px; }
+.bubble.bot code:not(pre code) { background: rgba(59,130,246,.15); color: var(--accent2); padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+.bubble.bot pre { background: #0d1117; border-radius: 8px; padding: 14px; overflow-x: auto; margin: 10px 0; border: 1px solid var(--border); }
+.bubble.bot pre code { font-size: 12px; }
+.bubble.bot blockquote { border-left: 3px solid var(--accent); padding-left: 12px; color: var(--muted); margin: 8px 0; }
+.bubble.bot table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 12px; }
+.bubble.bot th { background: rgba(59,130,246,.15); padding: 8px 12px; text-align: left; }
+.bubble.bot td { padding: 7px 12px; border-bottom: 1px solid var(--border); }
+.msg-time { font-size: 10px; color: var(--muted); margin-top: 5px; padding: 0 4px; }
+
+/* Mermaid diagram in chat */
+.mermaid-wrapper { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin: 10px 0; overflow-x: auto; }
+.mermaid-wrapper .mermaid { display: block; }
+
+/* ── Typing ── */
+#typing { display: none; align-self: flex-start; gap: 12px; align-items: center; }
+#typing.visible { display: flex; }
+.typing-dots { background: var(--bot-bg); border: 1px solid var(--border); border-radius: var(--radius); border-top-left-radius: 4px; padding: 14px 18px; display: flex; gap: 5px; align-items: center; }
+.typing-dots span { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: bounce 1.2s infinite; }
+.typing-dots span:nth-child(2) { animation-delay: .2s; }
+.typing-dots span:nth-child(3) { animation-delay: .4s; }
+@keyframes bounce { 0%,60%,100%{transform:translateY(0)} 30%{transform:translateY(-7px)} }
+
+/* ── Welcome ── */
+#welcome { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--muted); text-align: center; padding: 40px; }
+#welcome h2 { font-family: 'Syne', sans-serif; font-size: 28px; font-weight: 800; color: var(--text); }
+#welcome p  { font-size: 13px; line-height: 1.8; max-width: 400px; }
+#welcome .hint { font-size: 11px; color: #334155; margin-top: 12px; }
+#welcome .features { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; justify-content: center; }
+#welcome .feature-pill { padding: 6px 14px; border-radius: 20px; border: 1px solid var(--border); font-size: 11px; color: var(--muted); background: var(--panel); }
+#welcome .feature-pill.war { border-color: rgba(249,115,22,.4); color: var(--war); background: rgba(249,115,22,.05); }
+#welcome .feature-pill.devil { border-color: rgba(139,92,246,.4); color: var(--accent3); background: rgba(139,92,246,.05); }
+#welcome .feature-pill.time { border-color: rgba(6,182,212,.4); color: var(--accent2); background: rgba(6,182,212,.05); }
+#welcome .feature-pill.tree { border-color: rgba(59,130,246,.4); color: var(--accent); background: rgba(59,130,246,.05); }
+
+/* ── Input area ── */
+#input-area { padding: 16px 24px 4px; border-top: 1px solid var(--border); display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; flex-shrink: 0; }
+#file-attach-area { width: 100%; display: none; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+#file-attach-area.visible { display: flex; }
+.file-chip { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font-size: 11px; display: flex; align-items: center; gap: 6px; color: var(--accent2); }
+.file-chip .remove { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 14px; padding: 0 2px; transition: color .2s; }
+.file-chip .remove:hover { color: var(--danger); }
+#message-input { flex: 1; min-height: 50px; max-height: 160px; padding: 14px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); font-family: 'JetBrains Mono', monospace; font-size: 13.5px; resize: none; outline: none; transition: border-color .2s; line-height: 1.5; }
+#message-input:focus { border-color: var(--accent); }
+#message-input::placeholder { color: var(--muted); }
+.action-btn { width: 50px; height: 50px; border-radius: 12px; border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: transform .15s, opacity .15s; flex-shrink: 0; }
+#attach-btn { background: var(--bg); color: var(--muted); }
+#attach-btn:hover { color: var(--accent); transform: scale(1.05); }
+#send-btn { background: linear-gradient(135deg, var(--accent), var(--accent2)); }
+#send-btn:hover:not(:disabled) { transform: scale(1.05); }
+#send-btn:disabled { opacity: .4; cursor: not-allowed; }
+.action-btn svg { width: 20px; height: 20px; fill: currentColor; }
+
+/* ── Toast ── */
+#toast { position: fixed; bottom: 30px; right: 30px; background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 12px 20px; border-radius: 10px; font-size: 13px; transform: translateY(80px); opacity: 0; transition: all .3s; z-index: 9999; pointer-events: none; }
+#toast.show    { transform: none; opacity: 1; }
+#toast.success { border-color: var(--success); color: var(--success); }
+#toast.error   { border-color: var(--danger);  color: var(--danger); }
+#toast.warn    { border-color: var(--warn);    color: var(--warn); }
+
+/* Loading spinner */
+.spinner { width: 24px; height: 24px; border: 2px solid var(--border); border-top-color: var(--war); border-radius: 50%; animation: rotate 0.8s linear infinite; display: inline-block; }
+@keyframes rotate { to { transform: rotate(360deg); } }
+
+@media (max-width: 768px) {
+  #sidebar { position: absolute; z-index: 50; height: 100%; transform: translateX(-100%); }
+  #sidebar.open { transform: none; }
+  #sidebar-toggle { display: block; }
+  #experts-grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════════════════
+     SKILL MODAL
+══════════════════════════════════════════════════════════ -->
+<div class="modal-overlay" id="skill-modal">
+  <div class="modal">
+    <h2>✨ Ajouter un Skill</h2>
+    <input type="text" class="modal-input" id="skill-input" placeholder="Ex: Python, Rédaction, Data Science…"/>
+    <div class="modal-buttons">
+      <button class="btn btn-ghost" onclick="closeSkillModal()">Annuler</button>
+      <button class="btn btn-secondary" onclick="addSkill()">Ajouter</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     ⚔️ WAR ROOM OVERLAY
+══════════════════════════════════════════════════════════ -->
+<div id="warroom-overlay">
+  <div id="warroom-header">
+    <h2>⚔️ War Room — Mode Multi-Agents</h2>
+    <button id="warroom-close" onclick="closeWarRoom()">✕ Fermer</button>
+  </div>
+  <div id="warroom-body">
+
+    <!-- Input -->
+    <div style="display:flex;gap:10px;align-items:flex-end;">
+      <textarea id="warroom-input" placeholder="Décris ton problème, projet ou question complexe…"
+        style="flex:1;min-height:70px;max-height:140px;padding:14px;background:var(--bg);border:1px solid rgba(249,115,22,.3);border-radius:10px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:13px;resize:none;outline:none;line-height:1.6;"></textarea>
+      <button onclick="launchWarRoom()" id="wr-launch-btn"
+        style="padding:14px 20px;background:linear-gradient(135deg,#dc2626,var(--war));border:none;border-radius:10px;color:#fff;font-family:'Syne',sans-serif;font-weight:700;font-size:13px;cursor:pointer;white-space:nowrap;transition:opacity .2s;">
+        🚀 Lancer
+      </button>
+    </div>
+
+    <!-- Mode & Options -->
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:-8px;">
+      <!-- Mode preset -->
+      <div style="display:flex;align-items:center;gap:6px;">
+        <span style="font-size:10px;color:var(--muted);font-family:'Syne',sans-serif;font-weight:700;letter-spacing:.5px;">MODE</span>
+        <div id="wr-mode-tabs" style="display:flex;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:3px;gap:2px;">
+          <button class="wr-mode-btn active" data-mode="fast"     onclick="setWarRoomMode('fast')"     style="padding:5px 12px;border:none;border-radius:6px;font-family:'Syne',sans-serif;font-size:11px;font-weight:700;cursor:pointer;background:rgba(249,115,22,.2);color:var(--war);transition:all .2s;" title="1 expert, rapide">⚡ Fast</button>
+          <button class="wr-mode-btn"        data-mode="balanced" onclick="setWarRoomMode('balanced')" style="padding:5px 12px;border:none;border-radius:6px;font-family:'Syne',sans-serif;font-size:11px;font-weight:700;cursor:pointer;background:transparent;color:var(--muted);transition:all .2s;" title="3 experts, reviewer, résumé">⚖️ Balanced</button>
+          <button class="wr-mode-btn"        data-mode="full"     onclick="setWarRoomMode('full')"     style="padding:5px 12px;border:none;border-radius:6px;font-family:'Syne',sans-serif;font-size:11px;font-weight:700;cursor:pointer;background:transparent;color:var(--muted);transition:all .2s;" title="5 experts, débat, tests, résumé">🔥 Full</button>
+        </div>
+      </div>
+      <!-- Stack override -->
+      <div style="display:flex;align-items:center;gap:6px;flex:1;min-width:160px;">
+        <span style="font-size:10px;color:var(--muted);font-family:'Syne',sans-serif;font-weight:700;letter-spacing:.5px;">STACK</span>
+        <input id="wr-stack" type="text" placeholder="ex: python/flask, typescript/react…"
+          style="flex:1;padding:6px 10px;font-size:11px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);outline:none;font-family:'JetBrains Mono',monospace;" />
+      </div>
+      <!-- Streaming toggle -->
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:11px;color:var(--muted);font-family:'Syne',sans-serif;font-weight:600;" title="Afficher les résultats en temps réel">
+        <input type="checkbox" id="wr-stream-toggle" checked style="accent-color:var(--war);width:13px;height:13px;" />
+        Live stream
+      </label>
+    </div>
+    <!-- Mode description -->
+    <div id="wr-mode-desc" style="font-size:10px;color:var(--muted);padding:4px 2px;font-family:'JetBrains Mono',monospace;">
+      ⚡ Fast — 1 expert, sans reviewer ni tests. Idéal pour les questions rapides.
+    </div>
+
+    <!-- Expert Selector (family catalog + drag & drop) -->
+    <div id="expert-selector-section" style="margin-top:4px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+        <div style="font-size:11px;color:var(--muted);letter-spacing:.5px;font-family:'Syne',sans-serif;font-weight:700;">
+          🎭 EXPERTS — <span style="color:var(--accent3);font-weight:400;">Glisse jusqu'à 3 experts dans la zone, ou laisse l'IA choisir</span>
+        </div>
+        <input id="expert-search" type="text" placeholder="🔍 Rechercher…"
+          style="width:150px;padding:5px 10px;font-size:11px;border-radius:8px;background:var(--bg);border:1px solid var(--border);color:var(--text);outline:none;font-family:'JetBrains Mono',monospace;"
+          oninput="filterExperts(this.value)"/>
+      </div>
+
+      <!-- Catalog by family -->
+      <div id="expert-catalog"></div>
+
+      <!-- Drop zone -->
+      <div style="font-size:10px;color:var(--muted);margin:14px 0 6px;font-family:'Syne',sans-serif;font-weight:700;letter-spacing:.5px;">
+        📌 EXPERTS SÉLECTIONNÉS <span id="slot-count" style="color:var(--war);">0/1</span>
+        <span id="wr-experts-mode-hint" style="color:var(--muted);font-weight:400;margin-left:6px;">(mode Fast = 1)</span>
+      </div>
+      <div id="expert-drop-zone"
+        ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)">
+        <div id="drop-placeholder">⬆️ Glisse des experts ici • ou clique sur <strong>Ajouter</strong> dans leur fiche</div>
+      </div>
+
+      <div id="expert-selection-hint" style="font-size:10px;color:var(--muted);margin-top:6px;">
+        0 expert sélectionné — l'IA choisira les 3 meilleurs profils automatiquement.
+      </div>
+    </div>
+
+    <!-- Progress -->
+    <div id="warroom-progress">
+      <div class="progress-step" id="ps-pm">📋 Chef de Projet</div>
+      <div class="progress-step" id="ps-analyse">🔍 Orchestrateur</div>
+      <div class="progress-step" id="ps-debat">⚡ Experts</div>
+      <div class="progress-step" id="ps-synthese">🏆 Synthèse</div>
+      <div class="progress-step" id="ps-code">💻 Programmeur</div>
+    </div>
+
+    <!-- Chef de Projet plan -->
+    <div id="pm-section" style="display:none;">
+      <h3>📋 Chef de Projet — Plan Préliminaire</h3>
+      <div class="pm-objective" id="pm-objective"></div>
+      <div class="pm-steps" id="pm-steps"></div>
+      <div id="pm-risks-wrap" style="margin-top:4px;">
+        <div style="font-size:10px;color:var(--muted);margin-bottom:4px;letter-spacing:.5px;">RISQUES IDENTIFIÉS</div>
+        <div class="pm-risks" id="pm-risks"></div>
+      </div>
+    </div>
+
+    <!-- Expert cards -->
+    <div id="experts-grid">
+      <div class="expert-card" id="expert-0"><span class="expert-emoji">👤</span><div class="expert-role">Expert 1</div><div class="expert-specialty">En attente…</div><span class="expert-status waiting">En attente</span></div>
+      <div class="expert-card" id="expert-1"><span class="expert-emoji">👤</span><div class="expert-role">Expert 2</div><div class="expert-specialty">En attente…</div><span class="expert-status waiting">En attente</span></div>
+      <div class="expert-card" id="expert-2"><span class="expert-emoji">👤</span><div class="expert-role">Expert 3</div><div class="expert-specialty">En attente…</div><span class="expert-status waiting">En attente</span></div>
+      <div class="expert-card" id="expert-3" style="display:none;"><span class="expert-emoji">👤</span><div class="expert-role">Expert 4</div><div class="expert-specialty">En attente…</div><span class="expert-status waiting">En attente</span></div>
+      <div class="expert-card" id="expert-4" style="display:none;"><span class="expert-emoji">👤</span><div class="expert-role">Expert 5</div><div class="expert-specialty">En attente…</div><span class="expert-status waiting">En attente</span></div>
+    </div>
+
+    <!-- Thought trace -->
+    <div id="thought-trace">
+      <h3>📡 Flux de pensée</h3>
+      <div id="thought-lines">
+        <div class="thought-line"><span class="tl-time">--:--</span><span class="tl-text">En attente du lancement…</span></div>
+      </div>
+    </div>
+
+    <!-- Proposals -->
+    <div id="proposals-section" style="display:none;">
+      <h3>💬 Propositions des experts</h3>
+      <div class="proposal-tabs" id="proposal-tabs"></div>
+      <div id="proposal-contents"></div>
+    </div>
+
+    <!-- Synthesis -->
+    <div id="synthesis-section" style="display:none;">
+      <h3>🏆 Plan d'Action Final</h3>
+      <div id="synthesis-content"></div>
+      <div class="synthesis-actions">
+        <button class="btn btn-ghost" onclick="sendSynthesisToChat()" style="font-size:12px;">
+          💬 Envoyer dans le chat
+        </button>
+      </div>
+    </div>
+
+    <!-- Programmer Output -->
+    <div id="programmer-section" style="display:none;">
+      <h3 style="color:#4ade80;display:flex;align-items:center;gap:8px;">
+        💻 Code Généré par l'Agent Programmeur
+        <span id="wr-stack-badge" style="display:none;font-size:10px;background:rgba(6,182,212,.15);border:1px solid rgba(6,182,212,.3);color:var(--accent2);padding:2px 8px;border-radius:10px;font-family:'JetBrains Mono',monospace;"></span>
+        <span id="wr-complete-badge" style="display:none;font-size:10px;background:rgba(74,222,128,.15);border:1px solid rgba(74,222,128,.3);color:#4ade80;padding:2px 8px;border-radius:10px;font-family:'JetBrains Mono',monospace;">✅ COMPLET</span>
+        <span id="wr-incomplete-badge" style="display:none;font-size:10px;background:rgba(245,158,11,.15);border:1px solid rgba(245,158,11,.3);color:var(--warn);padding:2px 8px;border-radius:10px;font-family:'JetBrains Mono',monospace;">⚠️ TRONQUÉ</span>
+      </h3>
+
+      <!-- Files list -->
+      <div id="wr-files-section" style="display:none;margin-bottom:12px;">
+        <div style="font-size:10px;color:var(--muted);font-family:'Syne',sans-serif;font-weight:700;letter-spacing:.5px;margin-bottom:8px;">📁 FICHIERS GÉNÉRÉS</div>
+        <div id="wr-files-list" style="display:flex;flex-wrap:wrap;gap:8px;"></div>
+      </div>
+
+      <div id="programmer-content" style="background:rgba(0,0,0,.3);border:1px solid rgba(74,222,128,.2);border-radius:10px;padding:16px;overflow-x:auto;"></div>
+      <div class="synthesis-actions" style="margin-top:10px;">
+        <button class="btn btn-ghost" onclick="sendProgrammerToChat()" style="font-size:12px;border-color:rgba(74,222,128,.4);color:#4ade80;">
+          💻 Envoyer le code dans le chat
+        </button>
+        <button class="btn btn-ghost" onclick="copyProgrammerCode()" style="font-size:12px;">
+          📋 Copier le code
+        </button>
+      </div>
+    </div>
+
+    <!-- Code Review -->
+    <div id="review-section" style="display:none;">
+      <h3 style="font-family:'Syne',sans-serif;font-size:14px;font-weight:700;color:var(--accent2);margin-bottom:10px;">🔍 Revue de Code</h3>
+      <div id="review-content" style="background:rgba(6,182,212,.05);border:1px solid rgba(6,182,212,.2);border-radius:10px;padding:14px;font-size:12px;line-height:1.7;"></div>
+    </div>
+
+    <!-- Tests -->
+    <div id="tests-section" style="display:none;">
+      <h3 style="font-family:'Syne',sans-serif;font-size:14px;font-weight:700;color:var(--accent3);margin-bottom:10px;">🧪 Tests Unitaires</h3>
+      <div id="tests-content" style="background:rgba(139,92,246,.05);border:1px solid rgba(139,92,246,.2);border-radius:10px;padding:14px;overflow-x:auto;"></div>
+    </div>
+
+    <!-- Executive Summary -->
+    <div id="exec-summary-section" style="display:none;">
+      <h3 style="font-family:'Syne',sans-serif;font-size:14px;font-weight:700;color:var(--warn);margin-bottom:10px;">📊 Résumé Exécutif</h3>
+      <div id="exec-summary-content" style="background:rgba(245,158,11,.05);border:1px solid rgba(245,158,11,.2);border-radius:10px;padding:14px;font-size:12px;line-height:1.7;"></div>
+    </div>
+
+    <!-- Refine Panel -->
+    <div id="refine-section" style="display:none;background:rgba(59,130,246,.04);border:1px solid rgba(59,130,246,.2);border-radius:12px;padding:16px;">
+      <h3 style="font-family:'Syne',sans-serif;font-size:13px;font-weight:700;color:var(--accent);margin-bottom:10px;">🔧 Raffiner le Code</h3>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:8px;">Affine uniquement le programmeur sans relancer tout le pipeline (~80% moins cher en tokens).</div>
+      <div style="display:flex;gap:8px;align-items:flex-end;">
+        <textarea id="refine-input" placeholder="Ex: ajoute des logs, optimise la performance, gère les erreurs…"
+          style="flex:1;min-height:50px;max-height:100px;padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:12px;resize:none;outline:none;" rows="2"></textarea>
+        <button onclick="launchRefine()" id="wr-refine-btn"
+          style="padding:10px 16px;background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;border-radius:8px;color:#fff;font-family:'Syne',sans-serif;font-weight:700;font-size:12px;cursor:pointer;white-space:nowrap;transition:opacity .2s;">
+          🔧 Affiner
+        </button>
+      </div>
+    </div>
+
+    <!-- Feedback Panel -->
+    <div id="feedback-section" style="display:none;background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:14px;">
+      <div style="font-family:'Syne',sans-serif;font-size:11px;font-weight:700;color:var(--muted);letter-spacing:.5px;margin-bottom:10px;">⭐ NOTER LE CODE GÉNÉRÉ</div>
+      <div style="display:flex;gap:6px;margin-bottom:10px;" id="wr-stars">
+        <button class="wr-star" data-score="1" onclick="setFeedbackScore(1)" title="1/5">⭐</button>
+        <button class="wr-star" data-score="2" onclick="setFeedbackScore(2)" title="2/5">⭐</button>
+        <button class="wr-star" data-score="3" onclick="setFeedbackScore(3)" title="3/5">⭐</button>
+        <button class="wr-star" data-score="4" onclick="setFeedbackScore(4)" title="4/5">⭐</button>
+        <button class="wr-star" data-score="5" onclick="setFeedbackScore(5)" title="5/5">⭐</button>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input id="feedback-comment" type="text" placeholder="Commentaire facultatif…"
+          style="flex:1;padding:7px 10px;font-size:11px;background:var(--panel);border:1px solid var(--border);border-radius:8px;color:var(--text);outline:none;font-family:'JetBrains Mono',monospace;" />
+        <button onclick="submitFeedback()" id="wr-feedback-btn"
+          style="padding:7px 14px;background:var(--success);border:none;border-radius:8px;color:#fff;font-family:'Syne',sans-serif;font-weight:700;font-size:11px;cursor:pointer;transition:opacity .2s;">
+          Envoyer
+        </button>
+      </div>
+      <div id="feedback-avg" style="font-size:10px;color:var(--muted);margin-top:8px;display:none;"></div>
+    </div>
+
+  </div><!-- /warroom-body -->
+</div><!-- /warroom-overlay -->
+
+<!-- Expert detail modal -->
+<div id="expert-detail-modal" onclick="if(event.target===this)closeExpertDetail()">
+  <div id="expert-detail-box">
+    <span class="edb-emoji" id="edb-emoji"></span>
+    <div class="edb-role"    id="edb-role"></div>
+    <div class="edb-family"  id="edb-family"></div>
+    <div class="edb-specialty" id="edb-specialty"></div>
+    <div class="edb-actions">
+      <button class="edb-add"   id="edb-add-btn" onclick="addExpertFromDetail()">➕ Ajouter à la sélection</button>
+      <button class="edb-close" onclick="closeExpertDetail()">Fermer</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     😈 ADVOCATE MODAL
+══════════════════════════════════════════════════════════ -->
+<div id="advocate-overlay">
+  <div id="advocate-modal">
+    <div id="advocate-header">
+      <h2>😈 Avocat du Diable</h2>
+      <button class="modal-close-btn" onclick="closeAdvocate()">✕</button>
+    </div>
+    <div id="advocate-body">
+      <div id="advocate-placeholder" style="color:var(--muted);font-size:13px;text-align:center;padding:40px 0;">
+        Décris ton idée ou projet ci-dessous.<br/>
+        <small style="color:#334155;">L'IA trouvera impitoyablement toutes les failles.</small>
+      </div>
+      <div id="advocate-result" class="critique-content" style="display:none;"></div>
+    </div>
+    <div id="advocate-input-area">
+      <textarea id="advocate-input" placeholder="Ton idée, projet, plan business, code, stratégie…" rows="2"></textarea>
+      <button onclick="launchAdvocate()" id="adv-btn"
+        style="padding:10px 18px;background:linear-gradient(135deg,var(--accent3),#dc2626);border:none;border-radius:10px;color:#fff;font-family:'Syne',sans-serif;font-weight:700;font-size:13px;cursor:pointer;transition:opacity .2s;white-space:nowrap;align-self:flex-end;">
+        😈 Critiquer
+      </button>
+    </div>
+  </div>
+</div>
+
+
+
+
+
+<!-- ══════════════════════════════════════════════════════════
+     SIDEBAR
+══════════════════════════════════════════════════════════ -->
+<aside id="sidebar">
+  <div><h1>NeuralChat<span>Powered by OpenRouter</span></h1></div>
+
+  <div>
+    <div class="section-label">Modèle IA</div>
+    <select id="model-select">
+      {% for m in models %}
+      <option value="{{ m.id }}" {% if m.id == default_model %}selected{% endif %}>{{ m.label }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <div>
+    <div class="section-label">Contexte / Persona <span style="color:var(--success);font-size:10px;">(auto)</span></div>
+    <div class="field-group">
+      <label class="field-label">Comportement de l'IA</label>
+      <textarea id="system-prompt" placeholder="Ex: Tu es un expert Python. Réponds avec des exemples concrets…" oninput="debouncedSaveContext()"></textarea>
+      <small style="color:var(--muted);font-size:11px;margin-top:4px;">Sauvegardé automatiquement</small>
+    </div>
+  </div>
+
+  <div>
+    <div class="section-label">Skills & Expertise</div>
+    <div class="field-group">
+      <div class="skills-list" id="skills-list"></div>
+      <button class="btn btn-secondary btn-full" onclick="openSkillModal()">➕ Ajouter un skill</button>
+    </div>
+  </div>
+
+  <div>
+    <div class="section-label">⚡ Outils Avancés</div>
+    <div style="display:flex;flex-direction:column;gap:8px;">
+      <button class="btn btn-war btn-full" onclick="openWarRoom()">⚔️ War Room</button>
+      <button class="btn btn-advocate btn-full" onclick="openAdvocate()">😈 Avocat du Diable</button>
+    </div>
+  </div>
+
+  <div>
+    <div class="section-label">🌐 Langue de réponse</div>
+    <select id="lang-select" onchange="setLang(this.value)">
+      <option value="fr">🇫🇷 Français</option>
+      <option value="en">🇬🇧 English</option>
+      <option value="es">🇪🇸 Español</option>
+      <option value="de">🇩🇪 Deutsch</option>
+      <option value="pt">🇧🇷 Português</option>
+      <option value="ar">🇸🇦 العربية</option>
+      <option value="zh">🇨🇳 中文</option>
+      <option value="ja">🇯🇵 日本語</option>
+    </select>
+  </div>
+
+  <div>
+    <div class="section-label">Session</div>
+    <div id="stats">
+      Messages : <span id="stat-msgs">0</span><br/>
+      Tokens estimés : <span id="stat-tokens">0</span><br/>
+      Contexte actif : <span id="stat-ctx">Non</span><br/>
+      Skills actifs : <span id="stat-skills">0</span>
+    </div>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:8px;margin-top:auto;">
+    <button class="btn btn-ghost btn-full" onclick="exportChat()">⬇ Exporter la conv.</button>
+    <button class="btn btn-danger btn-full" onclick="clearChat()">✕ Effacer la mémoire</button>
+  </div>
+</aside>
+
+<!-- ══════════════════════════════════════════════════════════
+     MAIN AREA
+══════════════════════════════════════════════════════════ -->
+<div id="app-wrapper">
+  <div id="topbar">
+    <button id="sidebar-toggle" onclick="document.getElementById('sidebar').classList.toggle('open')">☰</button>
+    <span style="font-family:'Syne',sans-serif;font-weight:700;font-size:15px;color:var(--text);">💬 Chat</span>
+    <div id="topbar-right">
+      <span id="skills-indicator">✨ Skills actifs</span>
+      <span id="context-indicator">Contexte actif</span>
+      <span id="model-badge">{{ default_model }}</span>
+      <div id="auth-zone"></div>
+    </div>
+  </div>
+
+  <div id="messages">
+    <div id="welcome">
+      <h2>Bonjour 👋</h2>
+      <p>Assistant IA avec mémoire de conversation et outils avancés. Configure un contexte dans le panneau gauche pour personnaliser mon comportement.</p>
+      <div class="features">
+        <span class="feature-pill war">⚔️ War Room Multi-Agents</span>
+        <span class="feature-pill devil">😈 Avocat du Diable</span>
+        <span class="feature-pill" style="border-color:rgba(6,182,212,.4);color:var(--accent2);background:rgba(6,182,212,.05);">🌐 Choix de langue</span>
+      </div>
+      <div class="hint">Entrée pour envoyer · Shift+Entrée pour un saut de ligne</div>
+    </div>
+    <div id="typing">
+      <div class="avatar bot">🤖</div>
+      <div class="typing-dots"><span></span><span></span><span></span></div>
+    </div>
+  </div>
+
+  <div id="input-area">
+    <div id="file-attach-area"></div>
+    <button id="attach-btn" class="action-btn" title="Attacher un fichier"
+            onclick="document.getElementById('file-input').click()">
+      <svg viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+    </button>
+    <input type="file" id="file-input" multiple style="display:none" onchange="handleFileSelect(event)"/>
+    <textarea id="message-input" placeholder="Envoie un message…" rows="1"></textarea>
+    <button id="send-btn" class="action-btn" onclick="sendMessage()" title="Envoyer">
+      <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+    </button>
+  </div>
+
+  <!-- Special tools bar -->
+  <div class="special-tools" style="padding-bottom:12px;">
+    <button class="tool-btn war"   onclick="openWarRoom()">⚔️ War Room</button>
+    <button class="tool-btn devil" onclick="openAdvocate()">😈 Avocat du Diable</button>
+    <button class="tool-btn" onclick="prefillCurrentMessage()" style="border-color:rgba(100,116,139,.4);" title="Utiliser le message actuel comme base">📋 Utiliser message</button>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+/* ===================================================
+   GLOBALS
+   =================================================== */
+let hasContext    = false;
+let skills        = [];
+let attachedFiles = [];
+let contextSaveTimeout;
+let currentUser   = null;
+let warRoomData   = null;  // stocke la dernière synthèse War Room
+let currentLang   = 'fr';
+let mermaidCounter = 0;
+
+/* ===================================================
+   AUTH ZONE
+   =================================================== */
+function renderAuthZone() {
+  const zone = document.getElementById('auth-zone');
+  if (currentUser) {
+    const initial = currentUser.username.charAt(0).toUpperCase();
+    zone.innerHTML = `
+      <div class="user-menu-wrapper" id="user-menu-wrapper">
+        <button class="user-avatar-btn" onclick="toggleUserMenu(event)">
+          <div class="avatar-circle">${escHtml(initial)}</div>
+          <span>${escHtml(currentUser.username)}</span>
+          <span style="font-size:10px;color:var(--muted);margin-left:2px">▾</span>
+        </button>
+        <div class="user-dropdown" id="user-dropdown">
+          <div class="user-dropdown-header">
+            <div class="uname">${escHtml(currentUser.username)}</div>
+            <div class="uemail">${escHtml(currentUser.email || 'Pas d\'email renseigné')}</div>
+          </div>
+          <button class="dropdown-item" onclick="exportChat()">⬇ Exporter la conversation</button>
+          <button class="dropdown-item danger" onclick="doLogout()">↩ Se déconnecter</button>
+        </div>
+      </div>`;
+  } else {
+    zone.innerHTML = `
+      <button class="login-btn-topbar" onclick="window.location='/login'">
+        👤 Se connecter
+      </button>`;
+  }
+}
+
+function toggleUserMenu(e) {
+  e.stopPropagation();
+  document.getElementById('user-dropdown').classList.toggle('open');
+}
+
+document.addEventListener('click', () => {
+  const dd = document.getElementById('user-dropdown');
+  if (dd) dd.classList.remove('open');
+});
+
+async function doLogout() {
+  await fetch('/api/auth/logout', { method: 'POST' });
+  currentUser = null;
+  renderAuthZone();
+  showToast('Déconnecté', 'success');
+}
+
+async function loadUser() {
+  try {
+    const res  = await fetch('/api/auth/me');
+    const data = await res.json();
+    currentUser = data.logged_in
+      ? { username: data.username, email: data.email, created_at: data.created_at }
+      : null;
+  } catch {
+    currentUser = null;
+  }
+  renderAuthZone();
+}
+
+/* ===================================================
+   TEXTAREA + ENTER
+   =================================================== */
+const msgInput = document.getElementById('message-input');
+msgInput.addEventListener('input', () => {
+  msgInput.style.height = 'auto';
+  msgInput.style.height = Math.min(msgInput.scrollHeight, 160) + 'px';
+});
+msgInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+
+/* ===================================================
+   CONTEXT AUTO-SAVE
+   =================================================== */
+function saveContext() {
+  const prompt = document.getElementById('system-prompt').value.trim();
+  const model  = document.getElementById('model-select').value;
+  fetch('/api/context', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ system_prompt: prompt, model })
+  }).then(() => {
+    hasContext = !!prompt;
+    document.getElementById('context-indicator').style.display = hasContext ? 'flex' : 'none';
+    document.getElementById('stat-ctx').textContent = hasContext ? 'Oui' : 'Non';
+    document.getElementById('model-badge').textContent = model;
+  }).catch(console.error);
+}
+function debouncedSaveContext() {
+  clearTimeout(contextSaveTimeout);
+  contextSaveTimeout = setTimeout(saveContext, 1000);
+}
+document.getElementById('model-select').addEventListener('change', saveContext);
+
+/* ===================================================
+   LANGUAGE
+   =================================================== */
+function setLang(lang) {
+  currentLang = lang;
+  // Persist silently via chat route on next message, also call context endpoint
+  fetch('/api/context', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ lang })
+  }).catch(console.error);
+  showToast('Langue : ' + document.getElementById('lang-select').options[document.getElementById('lang-select').selectedIndex].text, 'success');
+}
+
+/* ===================================================
+   SKILLS
+   =================================================== */
+function openSkillModal() {
+  document.getElementById('skill-modal').classList.add('active');
+  document.getElementById('skill-input').value = '';
+  setTimeout(() => document.getElementById('skill-input').focus(), 100);
+}
+function closeSkillModal() { document.getElementById('skill-modal').classList.remove('active'); }
+async function addSkill() {
+  const name = document.getElementById('skill-input').value.trim();
+  if (!name) return showToast('Veuillez entrer un nom de skill', 'error');
+  if (skills.includes(name)) return showToast('Ce skill existe déjà', 'error');
+  skills.push(name); renderSkills(); closeSkillModal();
+  await syncSkills(); showToast('Skill "' + name + '" ajouté', 'success');
+}
+async function removeSkill(name) {
+  skills = skills.filter(s => s !== name); renderSkills();
+  await syncSkills(); showToast('Skill supprimé', 'success');
+}
+async function syncSkills() {
+  await fetch('/api/skills', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ skills }) });
+}
+function renderSkills() {
+  const container = document.getElementById('skills-list');
+  container.innerHTML = skills.map(s => `
+    <div class="skill-tag">
+      <span class="skill-name">✨ ${escHtml(s)}</span>
+      <button class="skill-remove" onclick="removeSkill('${escHtml(s)}')" title="Supprimer">✕</button>
+    </div>`).join('');
+  const has = skills.length > 0;
+  document.getElementById('skills-indicator').style.display = has ? 'flex' : 'none';
+  document.getElementById('stat-skills').textContent = skills.length;
+}
+
+/* ===================================================
+   FILE HANDLING
+   =================================================== */
+function handleFileSelect(event) {
+  Array.from(event.target.files).forEach(f => {
+    if (f.size > 5 * 1024 * 1024) return showToast(f.name + ' dépasse 5MB', 'error');
+    if (attachedFiles.find(x => x.name === f.name)) return showToast(f.name + ' déjà ajouté', 'error');
+    attachedFiles.push(f);
+  });
+  renderAttachedFiles(); event.target.value = '';
+}
+function renderAttachedFiles() {
+  const c = document.getElementById('file-attach-area');
+  c.innerHTML = attachedFiles.map(f => `
+    <div class="file-chip">
+      📄 ${escHtml(f.name)} <small>(${(f.size/1024).toFixed(1)}KB)</small>
+      <button class="remove" onclick="removeAttached('${escHtml(f.name)}')">✕</button>
+    </div>`).join('');
+  c.className = attachedFiles.length ? 'visible' : '';
+}
+function removeAttached(name) {
+  attachedFiles = attachedFiles.filter(f => f.name !== name);
+  renderAttachedFiles();
+}
+
+/* ===================================================
+   SEND MESSAGE
+   =================================================== */
+async function sendMessage() {
+    const text = msgInput.value.trim();
+    if (!text && attachedFiles.length === 0) return;
+    msgInput.value = ''; msgInput.style.height = 'auto';
+    document.getElementById('welcome')?.remove();
+
+    let display = text || '[Fichier joint]';
+    if (attachedFiles.length) display += '\n📎 ' + attachedFiles.map(f => f.name).join(', ');
+    appendMessage('user', display);
+    setTyping(true);
+
+    try {
+        const fd = new FormData();
+        fd.append('message', text);
+        fd.append('lang', currentLang);
+        attachedFiles.forEach(f => fd.append('files', f));
+        attachedFiles = []; renderAttachedFiles();
+
+        const res = await fetch('/api/chat', { method: 'POST', body: fd });
+        const data = await res.json();
+        setTyping(false);
+
+        if (data.error) return showToast(data.error, 'error');
+
+        if (data.ignored_files && data.ignored_files.length) {
+            data.ignored_files.forEach(fileReason => {
+                showToast(`Fichier ignoré: ${fileReason}`, 'warn');
+            });
+        }
+
+        appendMessage('bot', data.reply);
+        updateStats(data.total_messages, data.estimated_tokens);
+    } catch {
+        setTyping(false);
+        showToast('Erreur réseau', 'error');
+    }
+}
+
+/* ===================================================
+   RENDER MESSAGE
+   =================================================== */
+function appendMessage(role, text) {
+  const container = document.getElementById('messages');
+  const typing    = document.getElementById('typing');
+  const wrapper   = document.createElement('div');
+  wrapper.className = `msg-wrapper ${role}`;
+
+  const avatar = document.createElement('div');
+  avatar.className = `avatar ${role}`;
+  avatar.textContent = role === 'user'
+    ? (currentUser ? currentUser.username.charAt(0).toUpperCase() : '🧑')
+    : '🤖';
+
+  const inner  = document.createElement('div');
+  const bubble = document.createElement('div');
+  bubble.className = `bubble ${role}`;
+
+  if (role === 'bot') {
+    // Traiter les blocs Mermaid séparément du reste du markdown
+    bubble.innerHTML = renderWithMermaid(text);
+    bubble.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+    // Rendre les diagrammes Mermaid
+    renderMermaidInElement(bubble);
+  } else {
+    bubble.innerHTML = escHtml(text);
+  }
+
+  const time = document.createElement('div');
+  time.className   = 'msg-time';
+  time.textContent = new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+  if (role === 'user') time.style.textAlign = 'right';
+
+  inner.append(bubble, time);
+  if (role === 'user') wrapper.append(inner, avatar);
+  else                 wrapper.append(avatar, inner);
+
+  container.insertBefore(wrapper, typing);
+  container.scrollTop = container.scrollHeight;
+}
+
+function renderWithMermaid(text) {
+  // Remplacer les blocs ```mermaid par des div mermaid
+  return marked.parse(text.replace(/```mermaid\n?([\s\S]*?)```/g, (match, code) => {
+    const id = `mermaid-${++mermaidCounter}`;
+    return `<div class="mermaid-wrapper"><div class="mermaid" id="${id}">${escHtml(code.trim())}</div></div>`;
+  }));
+}
+
+async function renderMermaidInElement(el) {
+  if (typeof mermaid === 'undefined') return;  // mermaid non chargé
+  const nodes = el.querySelectorAll('.mermaid');
+  for (const node of nodes) {
+    try {
+      const code = node.textContent;
+      const { svg } = await mermaid.render(`mermaid-render-${Date.now()}`, code);
+      node.innerHTML = svg;
+    } catch (e) {
+      node.innerHTML = `<pre style="color:var(--danger);font-size:11px;">Erreur diagramme: ${e.message}</pre>`;
+    }
+  }
+}
+
+function setTyping(on) {
+  document.getElementById('typing').className = on ? 'visible' : '';
+  document.getElementById('send-btn').disabled = on;
+  if (on) document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
+}
+function updateStats(msgs, tokens) {
+  document.getElementById('stat-msgs').textContent   = msgs   ?? '–';
+  document.getElementById('stat-tokens').textContent = tokens ?? '–';
+}
+
+/* ===================================================
+   CLEAR & EXPORT
+   =================================================== */
+async function clearChat() {
+  if (!confirm('Effacer toute la mémoire de conversation ?')) return;
+  await fetch('/api/clear', { method: 'POST' });
+  document.getElementById('messages').innerHTML = `
+    <div id="welcome">
+      <h2>Conversation effacée ✓</h2><p>La mémoire a été réinitialisée.</p>
+    </div>
+    <div id="typing">
+      <div class="avatar bot">🤖</div>
+      <div class="typing-dots"><span></span><span></span><span></span></div>
+    </div>`;
+  updateStats(0, 0);
+  showToast('Mémoire effacée', 'success');
+}
+
+async function exportChat() {
+  const res  = await fetch('/api/history');
+  const data = await res.json();
+  if (!data.messages?.length) return showToast('Aucun message à exporter', 'error');
+
+  let md = '# Conversation — ' + new Date().toLocaleString('fr-FR') + '\n\n';
+  if (currentUser) md += '> **Utilisateur :** ' + currentUser.username + '\n\n';
+  if (data.system_prompt) md += '> **Contexte :** ' + data.system_prompt + '\n\n';
+  if (data.skills?.length) md += '> **Skills :** ' + data.skills.join(', ') + '\n\n---\n\n';
+  data.messages.forEach(m => {
+    md += (m.role === 'user' ? '**Vous**' : '**IA**') + '\n\n' + m.content + '\n\n---\n\n';
+  });
+  const a = Object.assign(document.createElement('a'), {
+    href: URL.createObjectURL(new Blob([md], { type: 'text/markdown' })),
+    download: 'conversation_' + Date.now() + '.md'
+  });
+  a.click();
+  showToast('Exporté', 'success');
+}
+
+/* ===================================================
+   ⚔️ WAR ROOM — Mode + Globals
+   =================================================== */
+let warRoomMode    = 'fast';
+let warRoomSynth   = '';   // garde la synthèse pour le raffinage
+let feedbackScore  = 0;
+
+const WR_MODE_DESCS = {
+  fast:     '⚡ Fast — 1 expert, sans reviewer ni tests. Idéal pour les questions rapides.',
+  balanced: '⚖️ Balanced — 3 experts, reviewer de code, résumé exécutif. Recommandé.',
+  full:     '🔥 Full — 5 experts, débat, avocat du diable, tests unitaires, résumé. Maximum de qualité.',
+};
+const WR_MODE_SLOTS = { fast: 1, balanced: 3, full: 5 };
+
+function setWarRoomMode(mode) {
+  warRoomMode = mode;
+  document.querySelectorAll('.wr-mode-btn').forEach(b => {
+    const isActive = b.dataset.mode === mode;
+    b.classList.toggle('active', isActive);
+    b.style.background = isActive ? 'rgba(249,115,22,.2)' : 'transparent';
+    b.style.color = isActive ? 'var(--war)' : 'var(--muted)';
+  });
+  document.getElementById('wr-mode-desc').textContent = WR_MODE_DESCS[mode] || '';
+  const maxSlots = WR_MODE_SLOTS[mode] || 3;
+  // Retirer les experts en trop si mode fast
+  while (selectedExperts.length > maxSlots) selectedExperts.pop();
+  renderDropZone();
+  const hint = document.getElementById('wr-experts-mode-hint');
+  if (hint) {
+    const labels = { fast: 'mode Fast = 1', balanced: 'mode Balanced = 3', full: 'mode Full = 5' };
+    hint.textContent = '(' + (labels[mode] || '') + ')';
+  }
+}
+
+function openWarRoom() {
+  document.getElementById('warroom-overlay').classList.add('active');
+  const msg = document.getElementById('message-input').value.trim();
+  if (msg) document.getElementById('warroom-input').value = msg;
+  if (!Object.keys(expertCatalog).length) loadExpertCatalog();
+}
+function closeWarRoom() {
+  document.getElementById('warroom-overlay').classList.remove('active');
+}
+
+function addThought(text, highlight = false) {
+  const lines = document.getElementById('thought-lines');
+  const d = new Date();
+  const t = d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0') + ':' + d.getSeconds().toString().padStart(2,'0');
+  const line = document.createElement('div');
+  line.className = 'thought-line' + (highlight ? ' highlight' : '');
+  line.innerHTML = `<span class="tl-time">${t}</span><span class="tl-text">${escHtml(text)}</span>`;
+  lines.appendChild(line);
+  lines.scrollTop = lines.scrollHeight;
+}
+
+function setProgressStep(step) {
+  const steps = ['pm', 'analyse', 'debat', 'synthese', 'code'];
+  const idx = steps.indexOf(step);
+  steps.forEach((s, i) => {
+    const el = document.getElementById('ps-' + s);
+    if (!el) return;
+    if (i < idx) el.className = 'progress-step done';
+    else if (i === idx) el.className = 'progress-step active';
+    else el.className = 'progress-step';
+  });
+}
+
+function setExpertState(idx, state, expert) {
+  const card = document.getElementById('expert-' + idx);
+  if (!card) return;
+  card.className = 'expert-card ' + state;
+  if (expert) {
+    card.querySelector('.expert-emoji').textContent = expert.emoji || '🤖';
+    card.querySelector('.expert-role').textContent  = expert.role;
+    card.querySelector('.expert-specialty').textContent = expert.specialty;
+  }
+  const status = card.querySelector('.expert-status');
+  status.className = 'expert-status ' + state;
+  status.textContent = state === 'thinking' ? '⚡ En réflexion…' :
+                       state === 'done'     ? '✓ Terminé'        : '⏳ En attente';
+}
+
+function _wrResetUI() {
+  document.getElementById('thought-lines').innerHTML = '';
+  ['proposals-section','synthesis-section','programmer-section','pm-section',
+   'review-section','tests-section','exec-summary-section','refine-section',
+   'feedback-section','wr-files-section'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = 'none';
+  });
+  ['wr-stack-badge','wr-complete-badge','wr-incomplete-badge'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = 'none';
+  });
+  [0,1,2,3,4].forEach(i => {
+    const card = document.getElementById('expert-' + i);
+    if (card) setExpertState(i, 'waiting', null);
+  });
+  setProgressStep('pm');
+  warRoomData = null;
+  warRoomSynth = '';
+}
+
+function _wrShowPM(pm) {
+  if (!pm?.objective) return;
+  document.getElementById('pm-objective').textContent = '🎯 ' + pm.objective;
+  const stepsEl = document.getElementById('pm-steps');
+  stepsEl.innerHTML = (pm.action_plan || []).map(s => `
+    <div class="pm-step">
+      <span class="step-num">${s.step}</span>
+      <span style="flex:1">${escHtml(s.action)}</span>
+      <span class="step-prio ${escHtml(s.priority || 'moyenne')}">${escHtml(s.priority || 'moyenne')}</span>
+    </div>`).join('');
+  const risksEl = document.getElementById('pm-risks');
+  risksEl.innerHTML = (pm.key_risks || []).map(r => `<span class="pm-risk-tag">⚠️ ${escHtml(r)}</span>`).join('');
+  document.getElementById('pm-section').style.display = 'block';
+  addThought('✅ Plan préliminaire — ' + (pm.action_plan || []).length + ' étapes');
+}
+
+function _wrShowExperts(experts, strategy, proposals) {
+  setProgressStep('debat');
+  addThought('✅ Stratégie : ' + (strategy || ''));
+  // Resize expert grid dynamically
+  const grid = document.getElementById('experts-grid');
+  const n = experts.length;
+  grid.style.gridTemplateColumns = n <= 3 ? 'repeat(3,1fr)' : 'repeat(auto-fill,minmax(160px,1fr))';
+  // Show/hide cards
+  [0,1,2,3,4].forEach(i => {
+    const card = document.getElementById('expert-' + i);
+    if (!card) return;
+    card.style.display = i < n ? 'block' : 'none';
+  });
+  experts.forEach((exp, i) => {
+    addThought(`${exp.emoji} ${exp.role}`);
+    setExpertState(i, 'done', exp);
+  });
+  // Proposals tabs
+  const tabsEl     = document.getElementById('proposal-tabs');
+  const contentsEl = document.getElementById('proposal-contents');
+  tabsEl.innerHTML = contentsEl.innerHTML = '';
+  (proposals || []).forEach((p, i) => {
+    const tab = document.createElement('button');
+    tab.className   = 'ptab' + (i === 0 ? ' active' : '');
+    tab.textContent = `${p.expert.emoji} ${p.expert.role}`;
+    tab.onclick = () => {
+      document.querySelectorAll('.ptab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.proposal-content').forEach(c => c.classList.remove('active'));
+      tab.classList.add('active');
+      document.getElementById('pc-' + i).classList.add('active');
+    };
+    tabsEl.appendChild(tab);
+    const content = document.createElement('div');
+    content.className = 'proposal-content' + (i === 0 ? ' active' : '');
+    content.id = 'pc-' + i;
+    content.innerHTML = marked.parse(p.text || '');
+    content.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+    contentsEl.appendChild(content);
+  });
+  document.getElementById('proposals-section').style.display = 'block';
+}
+
+function _wrShowSynthesis(synthesis) {
+  warRoomSynth = synthesis;
+  setProgressStep('synthese');
+  const synthEl = document.getElementById('synthesis-content');
+  synthEl.innerHTML = marked.parse(synthesis);
+  synthEl.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+  document.getElementById('synthesis-section').style.display = 'block';
+  addThought('🏆 Synthèse disponible', true);
+}
+
+function _wrShowCode(programmerOutput, files, complete, stack) {
+  setProgressStep('code');
+  addThought('💻 Code généré !', true);
+  const progEl = document.getElementById('programmer-content');
+  progEl.innerHTML = marked.parse(programmerOutput);
+  progEl.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+  document.getElementById('programmer-section').style.display = 'block';
+  // Stack badge
+  if (stack) {
+    const sb = document.getElementById('wr-stack-badge');
+    sb.textContent = '🔧 ' + stack;
+    sb.style.display = 'inline';
+  }
+  // Complete / truncated badge
+  document.getElementById(complete ? 'wr-complete-badge' : 'wr-incomplete-badge').style.display = 'inline';
+  // Files
+  if (files && files.length) {
+    const listEl = document.getElementById('wr-files-list');
+    listEl.innerHTML = files.map(f => `
+      <div class="wr-file-chip ${f.syntax_valid ? 'valid' : 'invalid'}" title="${escHtml(f.syntax_errors?.join(', ') || 'OK')}">
+        <span>📄 ${escHtml(f.filename)}</span>
+        <span class="fc-lang">${escHtml(f.language)}</span>
+        <span class="fc-lines">${f.line_count}L</span>
+        ${!f.syntax_valid ? '<span style="color:var(--danger);font-size:10px;">⚠️ syntax</span>' : '<span style="color:var(--success);font-size:10px;">✓</span>'}
+      </div>`).join('');
+    document.getElementById('wr-files-section').style.display = 'block';
+  }
+  // Show refine & feedback sections
+  document.getElementById('refine-section').style.display = 'block';
+  document.getElementById('feedback-section').style.display = 'block';
+}
+
+function _wrShowReview(reviewComments, programmerOutput, files) {
+  if (!reviewComments) return;
+  addThought('🔍 Revue de code terminée');
+  const revEl = document.getElementById('review-content');
+  revEl.innerHTML = marked.parse(reviewComments);
+  revEl.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+  document.getElementById('review-section').style.display = 'block';
+  // Update code if reviewer corrected it
+  if (programmerOutput) {
+    const progEl = document.getElementById('programmer-content');
+    progEl.innerHTML = marked.parse(programmerOutput);
+    progEl.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+    if (files?.length) {
+      const listEl = document.getElementById('wr-files-list');
+      listEl.innerHTML = files.map(f => `
+        <div class="wr-file-chip ${f.syntax_valid ? 'valid' : 'invalid'}">
+          <span>📄 ${escHtml(f.filename)}</span>
+          <span class="fc-lang">${escHtml(f.language)}</span>
+          <span class="fc-lines">${f.line_count}L</span>
+          ${!f.syntax_valid ? '<span style="color:var(--danger);font-size:10px;">⚠️</span>' : '<span style="color:var(--success);font-size:10px;">✓</span>'}
+        </div>`).join('');
+    }
+  }
+}
+
+function _wrShowTests(testsOutput) {
+  if (!testsOutput) return;
+  addThought('🧪 Tests unitaires générés');
+  const el = document.getElementById('tests-content');
+  el.innerHTML = marked.parse(testsOutput);
+  el.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+  document.getElementById('tests-section').style.display = 'block';
+}
+
+function _wrShowExecSummary(summary) {
+  if (!summary) return;
+  addThought('📊 Résumé exécutif disponible');
+  const el = document.getElementById('exec-summary-content');
+  el.innerHTML = marked.parse(summary);
+  document.getElementById('exec-summary-section').style.display = 'block';
+}
+
+/* ─── SSE streaming launch ─── */
+async function launchWarRoomSSE(query, model, btn) {
+  return new Promise((resolve, reject) => {
+    const stack  = document.getElementById('wr-stack').value.trim() || undefined;
+    const body   = JSON.stringify({
+      query, model, lang: currentLang,
+      selected_experts: selectedExperts,
+      mode: warRoomMode,
+      ...(stack ? { stack } : {}),
+    });
+
+    fetch('/api/warroom/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    }).then(res => {
+      if (!res.ok) { reject(new Error('HTTP ' + res.status)); return; }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      function pump() {
+        reader.read().then(({ done, value }) => {
+          if (done) { resolve(); return; }
+          buffer += decoder.decode(value, { stream: true });
+          const parts = buffer.split('\n\n');
+          buffer = parts.pop();
+          parts.forEach(part => {
+            if (!part.startsWith('data:')) return;
+            try {
+              const ev = JSON.parse(part.slice(5).trim());
+              handleSSEEvent(ev, btn);
+              if (ev.event === 'done' || ev.event === 'error') {
+                resolve();
+              }
+            } catch(e) { console.warn('SSE parse error', e); }
+          });
+          pump();
+        }).catch(reject);
+      }
+      pump();
+    }).catch(reject);
+  });
+}
+
+function handleSSEEvent(ev, btn) {
+  switch (ev.event) {
+    case 'pm_ready':
+      _wrShowPM(ev.pm);
+      setProgressStep('analyse');
+      break;
+    case 'experts_ready':
+      _wrShowExperts(ev.experts, ev.strategy, ev.proposals);
+      setProgressStep('synthese');
+      addThought('🏆 Synthèse en cours…', true);
+      warRoomData = { experts: ev.experts, proposals: ev.proposals };
+      break;
+    case 'debate_ready':
+      addThought('⚡ Débat inter-experts terminé');
+      break;
+    case 'synthesis_ready':
+      _wrShowSynthesis(ev.synthesis);
+      if (warRoomData) warRoomData.synthesis = ev.synthesis;
+      addThought('💻 Programmeur en cours…', true);
+      break;
+    case 'advocate_ready':
+      addThought('😈 Avocat du Diable : critique intégrée');
+      break;
+    case 'code_ready':
+      _wrShowCode(ev.programmer_output, ev.files, ev.complete, null);
+      if (warRoomData) { warRoomData.programmer_output = ev.programmer_output; warRoomData.files = ev.files; }
+      break;
+    case 'review_ready':
+      _wrShowReview(ev.review_comments, ev.programmer_output, ev.files);
+      if (warRoomData) warRoomData.programmer_output = ev.programmer_output;
+      break;
+    case 'tests_ready':
+      _wrShowTests(ev.tests_output);
+      break;
+    case 'done':
+      _wrShowExecSummary(ev.executive_summary);
+      // Stack badge from done event
+      if (ev.stack_detected) {
+        const sb = document.getElementById('wr-stack-badge');
+        sb.textContent = '🔧 ' + ev.stack_detected;
+        sb.style.display = 'inline';
+      }
+      ['ps-pm','ps-analyse','ps-debat','ps-synthese','ps-code'].forEach(id => {
+        document.getElementById(id).className = 'progress-step done';
+      });
+      addThought('🎉 War Room terminée !', true);
+      showToast('War Room terminée !', 'success');
+      btn.disabled = false; btn.textContent = '🚀 Relancer';
+      break;
+    case 'error':
+      showToast('Erreur : ' + (ev.message || 'inconnue'), 'error');
+      addThought('❌ Erreur : ' + (ev.message || ''));
+      btn.disabled = false; btn.textContent = '🚀 Lancer';
+      break;
+  }
+}
+
+/* ─── Sync (fallback) launch ─── */
+async function launchWarRoomSync(query, model, btn) {
+  const stack = document.getElementById('wr-stack').value.trim() || undefined;
+  const res   = await fetch('/api/warroom', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      query, model, lang: currentLang,
+      selected_experts: selectedExperts,
+      mode: warRoomMode,
+      ...(stack ? { stack } : {}),
+    }),
+  });
+  const data = await res.json();
+  if (data.error) { showToast(data.error, 'error'); return; }
+
+  warRoomData = data;
+  _wrShowPM(data.pm || {});
+  setProgressStep('analyse');
+  addThought('✅ Stratégie : ' + (data.strategy || ''));
+  _wrShowExperts(data.experts || [], data.strategy, data.proposals || []);
+  _wrShowSynthesis(data.synthesis || '');
+  _wrShowCode(data.programmer_output || '', data.files || [], data.complete, data.meta?.stack);
+  if (data.review_comments) _wrShowReview(data.review_comments, null, null);
+  _wrShowTests(data.tests_output);
+  _wrShowExecSummary(data.executive_summary);
+  ['ps-pm','ps-analyse','ps-debat','ps-synthese','ps-code'].forEach(id => {
+    document.getElementById(id).className = 'progress-step done';
+  });
+  addThought('🎉 War Room terminée !', true);
+  showToast('War Room terminée !', 'success');
+  btn.disabled = false; btn.textContent = '🚀 Relancer';
+}
+
+async function launchWarRoom() {
+  const query = document.getElementById('warroom-input').value.trim();
+  if (!query) return showToast('Décris ton problème d\'abord', 'error');
+
+  const model = document.getElementById('model-select').value;
+  const btn   = document.getElementById('wr-launch-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Analyse…';
+
+  _wrResetUI();
+  addThought('📡 Lancement War Room en mode ' + warRoomMode + '…', true);
+  if (selectedExperts.length > 0) addThought(`🎭 Experts sélectionnés : ${selectedExperts.join(', ')}`);
+  else addThought('🤖 Mode auto — l\'IA choisira les meilleurs experts');
+
+  const useStream = document.getElementById('wr-stream-toggle')?.checked ?? true;
+  try {
+    if (useStream) await launchWarRoomSSE(query, model, btn);
+    else           await launchWarRoomSync(query, model, btn);
+  } catch(e) {
+    showToast('Erreur réseau : ' + e.message, 'error');
+    addThought('❌ Erreur : ' + e.message);
+    btn.disabled = false; btn.textContent = '🚀 Lancer';
+  }
+}
+
+/* ─── Refine ─── */
+async function launchRefine() {
+  const refinement = document.getElementById('refine-input').value.trim();
+  if (!refinement) return showToast('Décris ce que tu veux affiner', 'error');
+  if (!warRoomSynth) return showToast('Lance d\'abord une War Room', 'error');
+
+  const btn   = document.getElementById('wr-refine-btn');
+  const query = document.getElementById('warroom-input').value.trim();
+  const model = document.getElementById('model-select').value;
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+
+  try {
+    const res  = await fetch('/api/warroom/refine', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refinement, synthesis: warRoomSynth, query, model, lang: currentLang }),
+    });
+    const data = await res.json();
+    if (data.error) { showToast(data.error, 'error'); return; }
+
+    const progEl = document.getElementById('programmer-content');
+    progEl.innerHTML = marked.parse(data.programmer_output || '');
+    progEl.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+    if (warRoomData) warRoomData.programmer_output = data.programmer_output;
+    // Update files
+    if (data.files?.length) {
+      const listEl = document.getElementById('wr-files-list');
+      listEl.innerHTML = data.files.map(f => `
+        <div class="wr-file-chip ${f.syntax_valid ? 'valid' : 'invalid'}">
+          <span>📄 ${escHtml(f.filename)}</span>
+          <span class="fc-lang">${escHtml(f.language)}</span>
+          <span class="fc-lines">${f.line_count}L</span>
+        </div>`).join('');
+      document.getElementById('wr-files-section').style.display = 'block';
+    }
+    document.getElementById(data.complete ? 'wr-complete-badge' : 'wr-incomplete-badge').style.display = 'inline';
+    addThought('🔧 Code raffiné : ' + (data.meta?.refinement || refinement));
+    showToast('Code raffiné ✓ (' + (data.meta?.duration_ms || 0) + 'ms)', 'success');
+    document.getElementById('refine-input').value = '';
+  } catch(e) {
+    showToast('Erreur raffinage : ' + e.message, 'error');
+  } finally {
+    btn.disabled = false; btn.textContent = '🔧 Affiner';
+  }
+}
+
+/* ─── Feedback ─── */
+function setFeedbackScore(score) {
+  feedbackScore = score;
+  document.querySelectorAll('.wr-star').forEach((btn, i) => {
+    btn.classList.toggle('active', i < score);
+  });
+}
+
+async function submitFeedback() {
+  if (!feedbackScore) return showToast('Sélectionne une note (1-5 ⭐)', 'error');
+  const comment = document.getElementById('feedback-comment').value.trim();
+  const query   = document.getElementById('warroom-input').value.trim();
+  const btn     = document.getElementById('wr-feedback-btn');
+  btn.disabled  = true;
+  try {
+    const res  = await fetch('/api/warroom/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ score: feedbackScore, comment, query }),
+    });
+    const data = await res.json();
+    if (data.recorded) {
+      showToast('Merci ! Note envoyée ⭐', 'success');
+      const avgEl = document.getElementById('feedback-avg');
+      avgEl.textContent = `Moyenne globale : ${data.avg_score}/5 (${data.total} avis)`;
+      avgEl.style.display = 'block';
+      // Reset stars
+      feedbackScore = 0;
+      document.querySelectorAll('.wr-star').forEach(b => b.classList.remove('active'));
+      document.getElementById('feedback-comment').value = '';
+    }
+  } catch(e) {
+    showToast('Erreur envoi feedback', 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+let selectedExperts  = [];   // array of expert IDs (max 3)
+let expertCatalog    = {};   // { id: { role, emoji, family, description, specialty } }
+let expertFamilies   = [];   // [{ id, label, color }]
+let currentDetailId  = null;
+let draggedExpertId  = null;
+
+// Family labels (fallback if API unavailable)
+const FAMILY_LABELS = {
+  informatique: "💻 Informatique & Tech",
+  art:          "🎨 Art & Design",
+  business:     "💼 Business & Management",
+  sante:        "🏥 Santé & Bien-être",
+  sciences:     "🔬 Sciences",
+  education:    "📚 Éducation & Coaching",
+  societe:      "🌍 Société & Environnement",
+};
+
+async function loadExpertCatalog() {
+  try {
+    const res  = await fetch('/api/experts');
+    const data = await res.json();
+    expertCatalog  = data.experts  || {};
+    expertFamilies = data.families || [];
+  } catch {
+    expertFamilies = Object.entries(FAMILY_LABELS).map(([id,label]) => ({ id, label, color: '#64748b' }));
+  }
+  renderExpertCatalog();
+}
+
+function renderExpertCatalog(filter = '') {
+  const container = document.getElementById('expert-catalog');
+  if (!container) return;
+  container.innerHTML = '';
+
+  const filterLow = filter.toLowerCase();
+
+  expertFamilies.forEach(fam => {
+    const members = Object.entries(expertCatalog).filter(([, e]) =>
+      e.family === fam.id &&
+      (!filter || e.role.toLowerCase().includes(filterLow) || e.description.toLowerCase().includes(filterLow))
+    );
+    if (!members.length) return;
+
+    const group = document.createElement('div');
+    group.className = 'family-group';
+    group.dataset.family = fam.id;
+
+    const header = document.createElement('div');
+    header.className = 'family-header';
+    header.style.color = fam.color;
+    header.innerHTML = `<span>${fam.label}</span><span class="family-toggle">▼</span>`;
+    header.onclick = () => group.classList.toggle('collapsed');
+
+    const cards = document.createElement('div');
+    cards.className = 'family-cards';
+
+    members.forEach(([id, e]) => {
+      const card = document.createElement('div');
+      card.className  = 'expert-mini-card';
+      card.draggable  = true;
+      card.dataset.id = id;
+      card.innerHTML  = `
+        <button class="emc-detail-btn" title="Voir la fiche complète" onclick="openExpertDetail('${id}',event)">ℹ</button>
+        <div class="emc-top">
+          <span class="emc-emoji">${e.emoji}</span>
+          <span class="emc-role">${e.role}</span>
+        </div>
+        <div class="emc-desc">${e.description}</div>`;
+
+      card.addEventListener('dragstart', e2 => {
+        draggedExpertId = id;
+        card.classList.add('dragging');
+        e2.dataTransfer.effectAllowed = 'copy';
+        e2.dataTransfer.setData('text/plain', id);
+      });
+      card.addEventListener('dragend', () => card.classList.remove('dragging'));
+
+      cards.appendChild(card);
+    });
+
+    group.appendChild(header);
+    group.appendChild(cards);
+    container.appendChild(group);
+  });
+}
+
+function filterExperts(val) { renderExpertCatalog(val); }
+
+/* ── Drop zone handlers ── */
+function onDragOver(e) {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'copy';
+  document.getElementById('expert-drop-zone').classList.add('drag-over');
+}
+function onDragLeave(e) {
+  if (!e.currentTarget.contains(e.relatedTarget))
+    document.getElementById('expert-drop-zone').classList.remove('drag-over');
+}
+function onDrop(e) {
+  e.preventDefault();
+  document.getElementById('expert-drop-zone').classList.remove('drag-over');
+  const id = draggedExpertId || e.dataTransfer.getData('text/plain');
+  if (id) addExpertToSlot(id);
+}
+
+/* ── Slot management ── */
+function addExpertToSlot(id) {
+  const maxSlots = WR_MODE_SLOTS[warRoomMode] || 3;
+  if (selectedExperts.includes(id)) { showToast('Expert déjà sélectionné', 'warn'); return; }
+  if (selectedExperts.length >= maxSlots) { showToast('Maximum ' + maxSlots + ' experts pour le mode ' + warRoomMode, 'warn'); return; }
+  if (!expertCatalog[id]) return;
+  selectedExperts.push(id);
+  renderDropZone();
+}
+function removeExpertFromSlot(id) {
+  selectedExperts = selectedExperts.filter(e => e !== id);
+  renderDropZone();
+}
+function refreshDropZone() { renderDropZone(); } // alias compat
+function renderDropZone() {
+  const maxSlots = WR_MODE_SLOTS[warRoomMode] || 3;
+  const zone = document.getElementById('expert-drop-zone');
+  const cnt  = document.getElementById('slot-count');
+  zone.innerHTML = '';
+  if (selectedExperts.length === 0) {
+    zone.classList.remove('full');
+    const ph = document.createElement('div');
+    ph.id = 'drop-placeholder';
+    ph.innerHTML = '⬆️ Glisse des experts ici • ou clique sur <strong>Ajouter</strong> dans leur fiche';
+    zone.appendChild(ph);
+  } else {
+    zone.classList.toggle('full', selectedExperts.length >= maxSlots);
+    selectedExperts.forEach(id => {
+      const e    = expertCatalog[id];
+      if (!e) return;
+      const slot = document.createElement('div');
+      slot.className = 'expert-slot';
+      slot.innerHTML = `<span>${e.emoji}</span><span>${e.role}</span><button class="slot-remove" onclick="removeExpertFromSlot('${id}')" title="Retirer">✕</button>`;
+      zone.appendChild(slot);
+    });
+    if (selectedExperts.length < maxSlots) {
+      const ph2 = document.createElement('div');
+      ph2.style.cssText = 'font-size:10px;color:var(--muted);margin-left:4px;';
+      ph2.textContent = `+ ${maxSlots - selectedExperts.length} slot(s) libre(s)`;
+      zone.appendChild(ph2);
+    }
+  }
+  zone.ondragover  = onDragOver;
+  zone.ondragleave = onDragLeave;
+  zone.ondrop      = onDrop;
+  if (cnt) cnt.textContent = `${selectedExperts.length}/${maxSlots}`;
+  const hint = document.getElementById('expert-selection-hint');
+  if (hint) {
+    if (selectedExperts.length === 0) {
+      hint.textContent = `0 expert sélectionné — l'IA choisira les ${maxSlots} meilleurs profils automatiquement.`;
+      hint.style.color = 'var(--muted)';
+    } else {
+      hint.textContent = `✅ ${selectedExperts.length}/${maxSlots} expert(s)${selectedExperts.length < maxSlots ? " — l'IA complétera les profils manquants" : " — War Room 100% manuelle !"}`;
+      hint.style.color = 'var(--war)';
+    }
+  }
+  if (currentDetailId) {
+    const addBtn = document.getElementById('edb-add-btn');
+    if (addBtn) addBtn.disabled = selectedExperts.includes(currentDetailId) || selectedExperts.length >= maxSlots;
+  }
+}
+/* ── Expert Detail Modal ── */
+function openExpertDetail(id, evt) {
+  if (evt) { evt.stopPropagation(); evt.preventDefault(); }
+  const e = expertCatalog[id];
+  if (!e) return;
+  currentDetailId = id;
+  const maxSlots = WR_MODE_SLOTS[warRoomMode] || 3;
+  const fam = expertFamilies.find(f => f.id === e.family);
+  document.getElementById('edb-emoji').textContent    = e.emoji;
+  document.getElementById('edb-role').textContent     = e.role;
+  document.getElementById('edb-family').textContent   = fam ? fam.label : e.family;
+  document.getElementById('edb-specialty').textContent = e.specialty;
+  const addBtn = document.getElementById('edb-add-btn');
+  addBtn.disabled = selectedExperts.includes(id) || selectedExperts.length >= maxSlots;
+  addBtn.textContent = selectedExperts.includes(id) ? '✅ Déjà sélectionné' : '➕ Ajouter à la sélection';
+  document.getElementById('expert-detail-modal').classList.add('active');
+}
+function closeExpertDetail() {
+  document.getElementById('expert-detail-modal').classList.remove('active');
+  currentDetailId = null;
+}
+function addExpertFromDetail() {
+  if (!currentDetailId) return;
+  addExpertToSlot(currentDetailId);
+  closeExpertDetail();
+}
+
+/* Load catalog on War Room open */
+
+function sendSynthesisToChat() {
+  if (!warRoomData) return;
+  const text = '**⚔️ War Room — Plan d\'Action Final**\n\n' + warRoomData.synthesis;
+  closeWarRoom();
+  document.getElementById('welcome')?.remove();
+  appendMessage('bot', text);
+  showToast('Synthèse ajoutée au chat', 'success');
+}
+
+function sendProgrammerToChat() {
+  if (!warRoomData?.programmer_output) return;
+  const text = '**💻 War Room — Code Généré par l\'Agent Programmeur**\n\n' + warRoomData.programmer_output;
+  closeWarRoom();
+  document.getElementById('welcome')?.remove();
+  appendMessage('bot', text);
+  showToast('Code ajouté au chat', 'success');
+}
+
+function copyProgrammerCode() {
+  if (!warRoomData?.programmer_output) return;
+  navigator.clipboard.writeText(warRoomData.programmer_output)
+    .then(() => showToast('Code copié !', 'success'))
+    .catch(() => showToast('Erreur lors de la copie', 'error'));
+}
+
+/* ===================================================
+   😈 AVOCAT DU DIABLE
+   =================================================== */
+function openAdvocate() {
+  document.getElementById('advocate-overlay').classList.add('active');
+  const msg = document.getElementById('message-input').value.trim();
+  if (msg) document.getElementById('advocate-input').value = msg;
+  setTimeout(() => document.getElementById('advocate-input').focus(), 100);
+}
+function closeAdvocate() {
+  document.getElementById('advocate-overlay').classList.remove('active');
+}
+
+async function launchAdvocate() {
+  const topic = document.getElementById('advocate-input').value.trim();
+  if (!topic) return showToast('Entre un sujet à critiquer', 'error');
+
+  const model = document.getElementById('model-select').value;
+  const btn   = document.getElementById('adv-btn');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+
+  document.getElementById('advocate-placeholder').style.display = 'none';
+  const result = document.getElementById('advocate-result');
+  result.style.display = 'block';
+  result.innerHTML = '<div style="text-align:center;padding:30px;color:var(--muted);"><span class="spinner"></span><br><br>L\'Avocat du Diable réfléchit…</div>';
+
+  try {
+    const res  = await fetch('/api/advocate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ topic, model })
+    });
+    const data = await res.json();
+    if (data.error) {
+      result.innerHTML = `<p style="color:var(--danger)">${escHtml(data.error)}</p>`;
+    } else {
+      result.innerHTML = marked.parse(data.critique);
+      result.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+    }
+  } catch(e) {
+    result.innerHTML = `<p style="color:var(--danger)">Erreur réseau: ${escHtml(e.message)}</p>`;
+  }
+
+  btn.disabled = false; btn.textContent = '😈 Critiquer';
+}
+
+
+
+/* ===================================================
+   UTILS
+   =================================================== */
+function prefillCurrentMessage() {
+  const msg = document.getElementById('message-input').value.trim();
+  if (!msg) return showToast('Aucun message à utiliser', 'warn');
+  document.getElementById('warroom-input').value  = msg;
+  document.getElementById('advocate-input').value = msg;
+  showToast('Message copié dans les outils', 'success');
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/'/g,"&#39;").replace(/"/g,'&quot;');
+}
+function showToast(msg, type = '') {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.className = 'show ' + type;
+  clearTimeout(t._tid);
+  t._tid = setTimeout(() => t.className = '', 3000);
+}
+
+// Fermer les overlays avec Escape
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    closeSkillModal();
+    closeWarRoom();
+    closeAdvocate();
+  }
+});
+
+// Fermer en cliquant en dehors du modal
+['warroom-overlay','advocate-overlay'].forEach(id => {
+  document.getElementById(id).addEventListener('click', function(e) {
+    if (e.target === this) {
+      closeWarRoom(); closeAdvocate();
+    }
+  });
+});
+
+/* ===================================================
+   INIT
+   =================================================== */
+(async () => {
+  await loadUser();
+  try {
+    const res  = await fetch('/api/history');
+    const data = await res.json();
+    if (data.messages?.length) {
+      document.getElementById('welcome')?.remove();
+      data.messages.forEach(m => appendMessage(m.role, m.content));
+      updateStats(data.messages.length, data.estimated_tokens);
+    }
+    if (data.system_prompt) {
+      document.getElementById('system-prompt').value = data.system_prompt;
+      hasContext = true;
+      document.getElementById('context-indicator').style.display = 'flex';
+      document.getElementById('stat-ctx').textContent = 'Oui';
+    }
+    if (data.skills?.length) { skills = data.skills; renderSkills(); }
+    if (data.model) {
+      document.getElementById('model-select').value      = data.model;
+      document.getElementById('model-badge').textContent = data.model;
+    }
+    if (data.lang) {
+      currentLang = data.lang;
+      const sel = document.getElementById('lang-select');
+      if (sel) sel.value = data.lang;
+    }
+  } catch (e) { console.error('Init error:', e); }
+})();
+</script>
+</body>
+</html>
