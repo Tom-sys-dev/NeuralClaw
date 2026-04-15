@@ -14,9 +14,9 @@ from typing import Any, Generator
 import requests as http_requests
 from flask import Blueprint, Response, jsonify, request, stream_with_context
 
-from config import DEFAULT_MODEL, logger
-from llm import call_llm
-from session_helpers import LANG_RULES_SHORT
+from config.py import DEFAULT_MODEL, logger
+from llm.py import call_llm
+from session_helpers.py import LANG_RULES_SHORT
 
 # ---------------------------------------------------------------------------
 # Retry / timeouts / budgets
