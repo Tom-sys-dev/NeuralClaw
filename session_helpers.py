@@ -4,8 +4,8 @@ from typing import Any
 
 from flask import session as flask_session
 
-from config import DEFAULT_MODEL
-from database import load_session_from_db
+from config.py import DEFAULT_MODEL
+from database.py import load_session_from_db
 
 # ---------------------------------------------------------------------------
 # Store en mémoire pour les utilisateurs anonymes
