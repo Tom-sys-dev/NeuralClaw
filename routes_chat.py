@@ -3,16 +3,16 @@ from __future__ import annotations
 import requests
 from flask import Blueprint, jsonify, render_template_string, request, session
 
-from config import DEFAULT_MODEL, FREE_MODELS, OPENROUTER_URL, logger
-from database import save_session_to_db
-from llm import _get_headers, perform_search
-from session_helpers import (
+from config.py import DEFAULT_MODEL, FREE_MODELS, OPENROUTER_URL, logger
+from database.py import save_session_to_db
+from llm.py import _get_headers, perform_search
+from session_helpers.py import (
     LANG_INSTRUCTIONS,
     build_system_content,
     estimate_tokens,
     get_session,
 )
-from templates_html import HTML_TEMPLATE
+from templates_html.py import HTML_TEMPLATE
 
 chat_bp = Blueprint("chat", __name__)
 
