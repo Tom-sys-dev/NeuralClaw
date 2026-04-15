@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>NeuralChat — Connexion</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet"/>
+<style>
+:root {
+  --bg:      #0a0e1a;
+  --panel:   #111827;
+  --border:  #1e2d45;
+  --accent:  #3b82f6;
+  --accent2: #06b6d4;
+  --accent3: #8b5cf6;
+  --text:    #e2e8f0;
+  --muted:   #64748b;
+  --danger:  #ef4444;
+  --success: #22c55e;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: 'JetBrains Mono', monospace;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px; position: relative; overflow: hidden;
+}
+.bg-blob {
+  position: absolute; border-radius: 50%;
+  filter: blur(80px); opacity: 0.12;
+  animation: drift 12s ease-in-out infinite alternate;
+  pointer-events: none;
+}
+.bg-blob-1 { width: 500px; height: 500px; background: var(--accent);  top: -150px; left: -150px; animation-delay: 0s; }
+.bg-blob-2 { width: 400px; height: 400px; background: var(--accent3); bottom: -100px; right: -100px; animation-delay: 3s; }
+.bg-blob-3 { width: 300px; height: 300px; background: var(--accent2); top: 40%; left: 50%; animation-delay: 6s; }
+@keyframes drift {
+  from { transform: translate(0, 0) scale(1); }
+  to   { transform: translate(30px, -30px) scale(1.08); }
+}
+.card {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 20px; padding: 44px 40px;
+  width: 100%; max-width: 420px;
+  position: relative; z-index: 1;
+  box-shadow: 0 24px 80px rgba(0,0,0,0.5);
+}
+.logo {
+  font-family: 'Syne', sans-serif; font-size: 26px; font-weight: 800;
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  background-clip: text; text-align: center; margin-bottom: 6px;
+}
+.logo-sub { text-align: center; font-size: 12px; color: var(--muted); margin-bottom: 36px; }
+.tabs {
+  display: flex; background: var(--bg);
+  border-radius: 10px; padding: 4px; margin-bottom: 28px;
+  border: 1px solid var(--border);
+}
+.tab-btn {
+  flex: 1; padding: 9px; border: none; border-radius: 8px;
+  background: transparent; color: var(--muted);
+  font-family: 'Syne', sans-serif; font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: all .2s;
+}
+.tab-btn.active { background: var(--accent); color: #fff; }
+.form-group { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
+.form-group label { font-size: 11px; color: var(--muted); letter-spacing: 0.5px; }
+.form-group input {
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 10px; color: var(--text);
+  font-family: 'JetBrains Mono', monospace; font-size: 13px;
+  padding: 13px 16px; outline: none; transition: border-color .2s, box-shadow .2s; width: 100%;
+}
+.form-group input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(59,130,246,0.15); }
+.form-group input::placeholder { color: var(--muted); }
+.submit-btn {
+  width: 100%; padding: 14px; border: none; border-radius: 10px;
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  color: #fff; font-family: 'Syne', sans-serif;
+  font-size: 14px; font-weight: 700; cursor: pointer;
+  transition: opacity .2s, transform .15s; margin-top: 8px;
+}
+.submit-btn:hover:not(:disabled) { opacity: 0.9; transform: translateY(-1px); }
+.submit-btn:disabled { opacity: .5; cursor: not-allowed; }
+.error-msg {
+  background: rgba(239,68,68,.1); border: 1px solid rgba(239,68,68,.3);
+  color: var(--danger); border-radius: 8px; padding: 10px 14px;
+  font-size: 12px; margin-top: 12px; display: none;
+  animation: shake .3s ease;
+}
+@keyframes shake { 0%,100%{ transform: translateX(0); } 25%{ transform: translateX(-6px); } 75%{ transform: translateX(6px); } }
+.error-msg.visible { display: block; }
+.success-msg {
+  background: rgba(34,197,94,.1); border: 1px solid rgba(34,197,94,.3);
+  color: var(--success); border-radius: 8px; padding: 10px 14px;
+  font-size: 12px; margin-top: 12px; display: none;
+}
+.success-msg.visible { display: block; }
+.divider {
+  text-align: center; color: var(--muted); font-size: 11px;
+  margin: 20px 0 16px; position: relative;
+}
+.divider::before, .divider::after {
+  content: ''; position: absolute; top: 50%; width: 40%;
+  height: 1px; background: var(--border);
+}
+.divider::before { left: 0; }
+.divider::after  { right: 0; }
+.guest-btn {
+  width: 100%; padding: 12px; border: 1px solid var(--border);
+  border-radius: 10px; background: transparent; color: var(--muted);
+  font-family: 'Syne', sans-serif; font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: all .2s;
+}
+.guest-btn:hover { border-color: var(--accent3); color: var(--accent3); }
+</style>
+</head>
+<body>
+<div class="bg-blob bg-blob-1"></div>
+<div class="bg-blob bg-blob-2"></div>
+<div class="bg-blob bg-blob-3"></div>
+
+<div class="card">
+  <div class="logo">NeuralChat</div>
+  <div class="logo-sub">Powered by OpenRouter</div>
+
+  <div class="tabs">
+    <button class="tab-btn active" id="tab-login"    onclick="switchTab('login')">Connexion</button>
+    <button class="tab-btn"        id="tab-register" onclick="switchTab('register')">Créer un compte</button>
+  </div>
+
+  <!-- LOGIN -->
+  <div id="form-login">
+    <div class="form-group">
+      <label>Nom d'utilisateur</label>
+      <input type="text" id="login-username" placeholder="votre_pseudo" autocomplete="username"/>
+    </div>
+    <div class="form-group">
+      <label>Mot de passe</label>
+      <input type="password" id="login-password" placeholder="••••••••" autocomplete="current-password"/>
+    </div>
+    <button class="submit-btn" id="login-btn" onclick="doLogin()">Se connecter →</button>
+    <div class="error-msg"   id="login-error"></div>
+    <div class="success-msg" id="login-success"></div>
+  </div>
+
+  <!-- REGISTER -->
+  <div id="form-register" style="display:none">
+    <div class="form-group">
+      <label>Nom d'utilisateur <span style="color:var(--danger)">*</span></label>
+      <input type="text" id="reg-username" placeholder="votre_pseudo" autocomplete="username"/>
+    </div>
+    <div class="form-group">
+      <label>Email <span style="color:var(--muted);font-size:10px;">(optionnel)</span></label>
+      <input type="email" id="reg-email" placeholder="you@example.com" autocomplete="email"/>
+    </div>
+    <div class="form-group">
+      <label>Mot de passe <span style="color:var(--danger)">*</span> <span style="color:var(--muted);font-size:10px;">(min. 6 caractères)</span></label>
+      <input type="password" id="reg-password" placeholder="••••••••" autocomplete="new-password"/>
+    </div>
+    <div class="form-group">
+      <label>Confirmer le mot de passe <span style="color:var(--danger)">*</span></label>
+      <input type="password" id="reg-confirm" placeholder="••••••••" autocomplete="new-password"/>
+    </div>
+    <button class="submit-btn" id="register-btn" onclick="doRegister()">Créer mon compte →</button>
+    <div class="error-msg"   id="register-error"></div>
+    <div class="success-msg" id="register-success"></div>
+  </div>
+
+  <div class="divider">ou</div>
+  <button class="guest-btn" onclick="window.location='/'">Continuer sans compte</button>
+</div>
+
+<script>
+function switchTab(tab) {
+  document.getElementById('form-login').style.display    = tab === 'login'    ? 'block' : 'none';
+  document.getElementById('form-register').style.display = tab === 'register' ? 'block' : 'none';
+  document.getElementById('tab-login').classList.toggle('active', tab === 'login');
+  document.getElementById('tab-register').classList.toggle('active', tab === 'register');
+  clearMessages();
+}
+function clearMessages() {
+  ['login-error','login-success','register-error','register-success'].forEach(id => {
+    const el = document.getElementById(id);
+    el.className = el.className.replace(' visible', '');
+  });
+}
+function showMsg(id, msg) {
+  const el = document.getElementById(id);
+  el.textContent = msg;
+  el.classList.add('visible');
+}
+
+async function doLogin() {
+  const btn      = document.getElementById('login-btn');
+  const username = document.getElementById('login-username').value.trim();
+  const password = document.getElementById('login-password').value.trim();
+  clearMessages();
+  if (!username || !password) return showMsg('login-error', 'Veuillez remplir tous les champs');
+  btn.disabled = true; btn.textContent = 'Connexion…';
+  try {
+    const res  = await fetch('/api/auth/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      showMsg('login-success', 'Bienvenue, ' + data.username + ' !');
+      setTimeout(() => window.location = '/', 800);
+    } else {
+      showMsg('login-error', data.error || 'Erreur inconnue');
+      btn.disabled = false; btn.textContent = 'Se connecter →';
+    }
+  } catch {
+    showMsg('login-error', 'Erreur réseau');
+    btn.disabled = false; btn.textContent = 'Se connecter →';
+  }
+}
+
+async function doRegister() {
+  const btn      = document.getElementById('register-btn');
+  const username = document.getElementById('reg-username').value.trim();
+  const email    = document.getElementById('reg-email').value.trim();
+  const password = document.getElementById('reg-password').value.trim();
+  const confirm  = document.getElementById('reg-confirm').value.trim();
+  clearMessages();
+  if (!username || !password || !confirm) return showMsg('register-error', 'Veuillez remplir les champs obligatoires');
+  if (password !== confirm) return showMsg('register-error', 'Les mots de passe ne correspondent pas');
+  if (password.length < 6) return showMsg('register-error', 'Le mot de passe doit faire au moins 6 caractères');
+  btn.disabled = true; btn.textContent = 'Création…';
+  try {
+    const res  = await fetch('/api/auth/register', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password, email })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      showMsg('register-success', 'Compte créé ! Redirection…');
+      setTimeout(() => window.location = '/', 900);
+    } else {
+      showMsg('register-error', data.error || 'Erreur inconnue');
+      btn.disabled = false; btn.textContent = 'Créer mon compte →';
+    }
+  } catch {
+    showMsg('register-error', 'Erreur réseau');
+    btn.disabled = false; btn.textContent = 'Créer mon compte →';
+  }
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  if (document.getElementById('form-login').style.display !== 'none') doLogin();
+  else doRegister();
+});
+</script>
+</body>
+</html>
