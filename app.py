@@ -44,10 +44,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 # CONFIG
 # ===========================================================================
 
-API_KEY = os.environ.get(
-    "OPENROUTER_API_KEY",
-    "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",
-)
+API_KEY = os.environ.get("OPENROUTER_API_KEY")
 OPENROUTER_URL  = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL   = "openai/gpt-oss-120b:free"
 
