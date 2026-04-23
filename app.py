@@ -1,3 +1,15 @@
+"""
+NeuralChat — Application Flask complète en un seul fichier.
+Fusion de : config.py, database.py, llm.py, session_helpers.py,
+            routes_auth.py, routes_chat.py, routes_warroom.py, app.py
+
+Usage :
+    python main.py
+    # ou avec variables d'environnement :
+    OPENROUTER_API_KEY=sk-... SECRET_KEY=xxx python main.py
+
+Le template HTML du chat est chargé depuis main.html (même dossier).
+"""
 from __future__ import annotations
 
 # ===========================================================================
@@ -1863,7 +1875,7 @@ def ide_install():
         if not valid:
             return jsonify({"error": reason}), 400
 
-    cmd = [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir"] + packages
+    cmd = [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir", "--break-system-packages"] + packages
     try:
         t0   = time.time()
         proc = subprocess.run(
@@ -1905,7 +1917,7 @@ def ide_uninstall():
         return jsonify({"error": reason}), 400
     try:
         proc = subprocess.run(
-            [sys.executable, "-m", "pip", "uninstall", "-y", pkg],
+            [sys.executable, "-m", "pip", "uninstall", "-y", "--break-system-packages", pkg],
             capture_output=True, text=True, timeout=60,
         )
         output = (proc.stdout + proc.stderr).strip()
@@ -1937,3 +1949,6 @@ app = create_app()
 if __name__ == "__main__":
     logger.info("NeuralChat — starting")
     init_db()
+    port  = int(os.environ.get("PORT", 5000))
+    debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
+    app.run(host="0.0.0.0", port=port, debug=debug)
