@@ -1877,16 +1877,18 @@ def ide_install():
         if not valid:
             return jsonify({"error": reason}), 400
 
-    cmd = [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir"] + packages
+    cmd = [
+        sys.executable, "-m", "pip", "install",
+        "--quiet", "--no-cache-dir", "--prefer-binary",
+    ] + packages
     try:
         t0   = time.time()
         # Hérite de l'environnement complet pour que pip s'installe dans
         # le même interpréteur/virtualenv que Flask (PYTHONPATH, VIRTUAL_ENV…)
-        install_env = os.environ.copy()
         proc = subprocess.run(
             cmd, capture_output=True, text=True,
             timeout=IDE_INSTALL_TIMEOUT,
-            env=install_env,
+            env=os.environ.copy(),
         )
         duration_ms = int((time.time() - t0) * 1000)
         output = (proc.stdout + proc.stderr).strip()
