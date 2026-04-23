@@ -1,1862 +1,2729 @@
-"""
-NeuralChat — Application Flask complète en un seul fichier.
-Fusion de : config.py, database.py, llm.py, session_helpers.py,
-            routes_auth.py, routes_chat.py, routes_warroom.py, app.py
-
-Usage :
-    python main.py
-    # ou avec variables d'environnement :
-    OPENROUTER_API_KEY=sk-... SECRET_KEY=xxx python main.py
-
-Le template HTML du chat est chargé depuis main.html (même dossier).
-"""
-from __future__ import annotations
-
-# ===========================================================================
-# IMPORTS
-# ===========================================================================
-import ast
-import hashlib
-import json
-import logging
-import os
-import re
-import sqlite3
-import threading
-import time
-import urllib.parse
-import uuid
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from contextlib import closing
-from typing import Any, Dict, Generator, List
-
-import requests as http_requests
-from flask import (
-    Blueprint, Flask, Response, jsonify,
-    redirect, render_template_string, request,
-    session as flask_session, stream_with_context,
-)
-from werkzeug.security import check_password_hash, generate_password_hash
-
-
-# ===========================================================================
-# CONFIG
-# ===========================================================================
-
-API_KEY = os.environ.get("OPENROUTER_API_KEY")
-OPENROUTER_URL  = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL   = "openai/gpt-oss-120b:free"
-
-FREE_MODELS: list[dict[str, str]] = [
-    {"id": "minimax/minimax-m2.5:free",               "label": "MiniMax M2.5"},
-    {"id": "meta-llama/llama-3.3-70b-instruct:free",  "label": "Llama 3.3 70B"},
-    {"id": "openrouter/elephant-alpha",               "label": "elephant"},
-    {"id": "nvidia/nemotron-3-super-120b-a12b:free",  "label": "Nemotron 3"},
-    {"id": "arcee-ai/trinity-large-preview:free",     "label": "Trinity"},
-    {"id": "openai/gpt-oss-120b:free",                "label": "GPT-oss"},
-]
-
-DB_PATH  = "neuralchat.db"
-PING_URL = "https://neuralclaw.onrender.com"
-
-logging.basicConfig(level=logging.INFO, format="%(levelname)s — %(message)s")
-logger = logging.getLogger(__name__)
-
-
-# ===========================================================================
-# DATABASE
-# ===========================================================================
-
-def get_db() -> sqlite3.Connection:
-    db = sqlite3.connect(DB_PATH)
-    db.row_factory = sqlite3.Row
-    return db
-
-
-def init_db() -> None:
-    with closing(get_db()) as db:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                username      TEXT PRIMARY KEY,
-                password_hash TEXT NOT NULL,
-                email         TEXT,
-                created_at    TEXT NOT NULL
-            )
-        """)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS chat_sessions (
-                username      TEXT PRIMARY KEY,
-                messages      TEXT NOT NULL,
-                system_prompt TEXT,
-                model         TEXT NOT NULL,
-                skills        TEXT NOT NULL,
-                lang          TEXT NOT NULL DEFAULT 'fr',
-                FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
-            )
-        """)
-        db.execute("CREATE INDEX IF NOT EXISTS idx_users_username    ON users(username)")
-        db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_username ON chat_sessions(username)")
-        db.commit()
-        logger.info("Base de données initialisée")
-
-
-def _default_session() -> dict:
-    return {
-        "messages":      [],
-        "system_prompt": "",
-        "model":         DEFAULT_MODEL,
-        "skills":        [],
-        "lang":          "fr",
-    }
-
-
-def load_session_from_db(username: str) -> dict:
-    with closing(get_db()) as db:
-        row = db.execute(
-            "SELECT * FROM chat_sessions WHERE username = ?", (username,)
-        ).fetchone()
-        if row is None:
-            sess = _default_session()
-            db.execute(
-                "INSERT INTO chat_sessions "
-                "(username, messages, system_prompt, model, skills, lang) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (username, json.dumps(sess["messages"]), sess["system_prompt"],
-                 sess["model"], json.dumps(sess["skills"]), sess["lang"]),
-            )
-            db.commit()
-            return sess
-        try:
-            return {
-                "messages":      json.loads(row["messages"]),
-                "system_prompt": row["system_prompt"] or "",
-                "model":         row["model"],
-                "skills":        json.loads(row["skills"]),
-                "lang":          row["lang"] or "fr",
-            }
-        except json.JSONDecodeError as exc:
-            logger.error("Erreur décodage JSON pour %s : %s", username, exc)
-            return _default_session()
-
-
-def save_session_to_db(username: str, sess: dict) -> None:
-    if username == "__anon__":
-        return
-    with closing(get_db()) as db:
-        exists = db.execute(
-            "SELECT 1 FROM chat_sessions WHERE username = ?", (username,)
-        ).fetchone()
-        if exists is None:
-            db.execute(
-                "INSERT INTO chat_sessions "
-                "(username, messages, system_prompt, model, skills, lang) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (username, json.dumps(sess["messages"]), sess["system_prompt"],
-                 sess["model"], json.dumps(sess["skills"]), sess.get("lang", "fr")),
-            )
-        else:
-            db.execute(
-                "UPDATE chat_sessions "
-                "SET messages=?, system_prompt=?, model=?, skills=?, lang=? "
-                "WHERE username=?",
-                (json.dumps(sess["messages"]), sess["system_prompt"], sess["model"],
-                 json.dumps(sess["skills"]), sess.get("lang", "fr"), username),
-            )
-        db.commit()
-
-
-# ===========================================================================
-# LLM
-# ===========================================================================
-
-def _get_headers() -> dict:
-    return {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type":  "application/json",
-    }
-
-
-def call_llm(
-    messages:   list[dict],
-    model:      str = DEFAULT_MODEL,
-    max_tokens: int = 500000,
-) -> str:
-    payload = {"model": model, "messages": messages, "max_tokens": max_tokens}
-    resp = http_requests.post(
-        OPENROUTER_URL, headers=_get_headers(), json=payload, timeout=180
-    )
-    resp.raise_for_status()
-    result = resp.json()
-    if "error" in result:
-        err = result["error"]
-        raise RuntimeError(
-            f"IA indisponible ({err.get('code', '?')}): {err.get('message', '')}"
-        )
-    return result["choices"][0]["message"]["content"]
-
-
-def perform_search(query: str, max_results: int = 5) -> str:
-    try:
-        params: Dict[str, str] = {
-            "q": query, "format": "json", "no_html": "1", "skip_disambig": "1",
-        }
-        response = http_requests.get(
-            "https://api.duckduckgo.com/", params=params, timeout=10
-        )
-        response.raise_for_status()
-        data = response.json()
-        results: List[str] = []
-        abstract     = data.get("AbstractText",   "").strip()
-        abstract_src = data.get("AbstractSource", "").strip()
-        abstract_url = data.get("AbstractURL",    "").strip()
-        if abstract:
-            results.append(
-                f"Résultat instantané (source : {abstract_src or 'DuckDuckGo'})\n"
-                f"{abstract}\n{abstract_url}\n"
-            )
-        else:
-            results.append(f"Recherche Internet pour « {query} » :\n")
-        related: List[Dict] = data.get("RelatedTopics", [])
-        count = 0
-        for item in related:
-            if count >= max_results:
-                break
-            if isinstance(item, dict) and "FirstURL" in item:
-                title   = item.get("Text", "Titre inconnu").split(" – ")[0]
-                snippet = re.sub(r"<[^>]+>", "", item.get("Text", ""))
-                url     = item.get("FirstURL", "#")
-                results.append(f"{count + 1}. {title}\n{snippet[:200]}\n{url}\n")
-                count += 1
-            elif isinstance(item, dict) and "Topics" in item:
-                for sub in item["Topics"]:
-                    if count >= max_results:
-                        break
-                    title   = sub.get("Text", "").split(" – ")[0]
-                    snippet = re.sub(r"<[^>]+>", "", sub.get("Text", ""))
-                    url     = sub.get("FirstURL", "#")
-                    results.append(f"{count + 1}. {title}\n{snippet[:200]}\n{url}\n")
-                    count += 1
-        if count == 0 and not abstract:
-            results.append("Aucun résultat trouvé.")
-        return "\n".join(results)
-    except Exception as exc:
-        return f"Erreur de recherche : {exc}"
-
-
-# ===========================================================================
-# SESSION HELPERS
-# ===========================================================================
-
-_anon_store: dict[str, dict[str, Any]] = {}
-
-LANG_INSTRUCTIONS: dict[str, str] = {
-    "fr": "Tu réponds TOUJOURS en français, quelle que soit la langue du message reçu.",
-    "en": "You ALWAYS respond in English, regardless of the language of the received message.",
-    "es": "Respondes SIEMPRE en español, independientemente del idioma del mensaje recibido.",
-    "de": "Du antwortest IMMER auf Deutsch, unabhängig von der Sprache der empfangenen Nachricht.",
-    "pt": "Você responde SEMPRE em português, independentemente do idioma da mensagem recebida.",
-    "ar": "أنت ترد دائماً باللغة العربية، بغض النظر عن لغة الرسالة المستلمة.",
-    "zh": "你始终用中文回复，不管收到的消息是什么语言。",
-    "ja": "受け取ったメッセージの言語に関わらず、常に日本語で返答してください。",
-}
-
-LANG_RULES_SHORT: dict[str, str] = {
-    "fr": "Réponds TOUJOURS en français, sans exception.",
-    "en": "Always respond in English, without exception.",
-    "es": "Responde SIEMPRE en español, sin excepción.",
-    "de": "Antworte IMMER auf Deutsch, ohne Ausnahme.",
-    "pt": "Responda SEMPRE em português, sem exceção.",
-    "ar": "أجب دائماً باللغة العربية، دون استثناء.",
-    "zh": "始终用中文回答，没有例外。",
-    "ja": "常に日本語で答えてください、例外なく。",
-}
-
-
-def get_session() -> dict:
-    username: str = flask_session.get("username", "__anon__")
-    if username == "__anon__":
-        if "__anon__" not in _anon_store:
-            _anon_store["__anon__"] = {
-                "messages": [], "system_prompt": "", "model": DEFAULT_MODEL,
-                "skills": [], "lang": "fr",
-            }
-        return _anon_store["__anon__"]
-    return load_session_from_db(username)
-
-
-def build_system_content(sess: dict) -> str:
-    parts: list[str] = []
-    if sess.get("skills"):
-        parts.append(f"Skills and areas of expertise: {', '.join(sess['skills'])}.")
-    if sess.get("system_prompt"):
-        parts.append(sess["system_prompt"])
-    return "\n\n".join(parts)
-
-
-def estimate_tokens(messages: list[dict]) -> int:
-    return sum(len(m.get("content", "")) for m in messages) // 4
-
-
-# ===========================================================================
-# TEMPLATES HTML
-# ===========================================================================
-
-_BASE = os.path.dirname(os.path.abspath(__file__))
-
-LOGIN_TEMPLATE = """<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>NeuralChat — Connexion</title>
+<title>NeuralChat</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/tokyo-night-dark.min.css"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
 <style>
-:root{--bg:#0a0e1a;--panel:#111827;--border:#1e2d45;--accent:#3b82f6;--accent2:#06b6d4;--accent3:#8b5cf6;--text:#e2e8f0;--muted:#64748b;--danger:#ef4444;--success:#22c55e}
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'JetBrains Mono',monospace;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;position:relative;overflow:hidden}
-.bg-blob{position:absolute;border-radius:50%;filter:blur(80px);opacity:.12;animation:drift 12s ease-in-out infinite alternate;pointer-events:none}
-.bg-blob-1{width:500px;height:500px;background:var(--accent);top:-150px;left:-150px;animation-delay:0s}
-.bg-blob-2{width:400px;height:400px;background:var(--accent3);bottom:-100px;right:-100px;animation-delay:3s}
-.bg-blob-3{width:300px;height:300px;background:var(--accent2);top:40%;left:50%;animation-delay:6s}
-@keyframes drift{from{transform:translate(0,0) scale(1)}to{transform:translate(30px,-30px) scale(1.08)}}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:20px;padding:44px 40px;width:100%;max-width:420px;position:relative;z-index:1;box-shadow:0 24px 80px rgba(0,0,0,.5)}
-.logo{font-family:'Syne',sans-serif;font-size:26px;font-weight:800;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;text-align:center;margin-bottom:6px}
-.logo-sub{text-align:center;font-size:12px;color:var(--muted);margin-bottom:36px}
-.tabs{display:flex;background:var(--bg);border-radius:10px;padding:4px;margin-bottom:28px;border:1px solid var(--border)}
-.tab-btn{flex:1;padding:9px;border:none;border-radius:8px;background:transparent;color:var(--muted);font-family:'Syne',sans-serif;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s}
-.tab-btn.active{background:var(--accent);color:#fff}
-.form-group{display:flex;flex-direction:column;gap:6px;margin-bottom:16px}
-.form-group label{font-size:11px;color:var(--muted);letter-spacing:.5px}
-.form-group input{background:var(--bg);border:1px solid var(--border);border-radius:10px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:13px;padding:13px 16px;outline:none;transition:border-color .2s,box-shadow .2s;width:100%}
-.form-group input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(59,130,246,.15)}
-.form-group input::placeholder{color:var(--muted)}
-.submit-btn{width:100%;padding:14px;border:none;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;font-family:'Syne',sans-serif;font-size:14px;font-weight:700;cursor:pointer;transition:opacity .2s,transform .15s;margin-top:8px}
-.submit-btn:hover:not(:disabled){opacity:.9;transform:translateY(-1px)}
-.submit-btn:disabled{opacity:.5;cursor:not-allowed}
-.error-msg{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:var(--danger);border-radius:8px;padding:10px 14px;font-size:12px;margin-top:12px;display:none;animation:shake .3s ease}
-@keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-6px)}75%{transform:translateX(6px)}}
-.error-msg.visible{display:block}
-.success-msg{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.3);color:var(--success);border-radius:8px;padding:10px 14px;font-size:12px;margin-top:12px;display:none}
-.success-msg.visible{display:block}
-.divider{text-align:center;color:var(--muted);font-size:11px;margin:20px 0 16px;position:relative}
-.divider::before,.divider::after{content:'';position:absolute;top:50%;width:40%;height:1px;background:var(--border)}
-.divider::before{left:0}
-.divider::after{right:0}
-.guest-btn{width:100%;padding:12px;border:1px solid var(--border);border-radius:10px;background:transparent;color:var(--muted);font-family:'Syne',sans-serif;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s}
-.guest-btn:hover{border-color:var(--accent3);color:var(--accent3)}
+:root {
+  --bg:      #0a0e1a;
+  --panel:   #111827;
+  --border:  #1e2d45;
+  --accent:  #3b82f6;
+  --accent2: #06b6d4;
+  --accent3: #8b5cf6;
+  --user-bg: #1d3461;
+  --bot-bg:  #131f35;
+  --text:    #e2e8f0;
+  --muted:   #64748b;
+  --danger:  #ef4444;
+  --success: #22c55e;
+  --warn:    #f59e0b;
+  --war:     #f97316;
+  --radius:  12px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'JetBrains Mono', monospace; background: var(--bg); color: var(--text); height: 100vh; display: flex; overflow: hidden; }
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* ── Sidebar ── */
+#sidebar {
+  width: 300px; min-width: 300px; background: var(--panel);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; padding: 24px 20px; gap: 20px;
+  overflow-y: auto; transition: transform 0.3s ease;
+}
+#sidebar h1 {
+  font-family: 'Syne', sans-serif; font-size: 22px; font-weight: 800;
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  background-clip: text; letter-spacing: -0.5px;
+}
+#sidebar h1 span { display: block; font-size: 11px; font-weight: 400; color: var(--muted); margin-top: 2px; -webkit-text-fill-color: var(--muted); }
+.section-label { font-size: 10px; font-weight: 600; letter-spacing: 1.5px; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+.field-group { display: flex; flex-direction: column; gap: 8px; }
+label.field-label { font-size: 12px; color: var(--muted); }
+select, textarea, input[type="text"] {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  color: var(--text); font-family: 'JetBrains Mono', monospace;
+  font-size: 12px; padding: 10px 12px; width: 100%;
+  transition: border-color 0.2s; outline: none; resize: none;
+}
+select:focus, textarea:focus, input:focus { border-color: var(--accent); }
+#system-prompt { min-height: 110px; line-height: 1.6; }
+.btn {
+  display: flex; align-items: center; justify-content: center;
+  gap: 8px; padding: 10px 16px; border-radius: 8px; border: none;
+  cursor: pointer; font-family: 'Syne', sans-serif; font-weight: 600;
+  font-size: 13px; transition: all 0.2s;
+}
+.btn-secondary { background: var(--accent3); color: #fff; }
+.btn-secondary:hover { background: #7c3aed; }
+.btn-danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
+.btn-danger:hover { background: rgba(239,68,68,.1); }
+.btn-ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+.btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+.btn-war { background: linear-gradient(135deg, #dc2626, var(--war)); color: #fff; }
+.btn-war:hover { opacity: 0.9; transform: scale(1.02); }
+.btn-advocate { background: linear-gradient(135deg, #7c3aed, #dc2626); color: #fff; }
+.btn-advocate:hover { opacity: 0.9; }
+.btn-full { width: 100%; }
+#stats { font-size: 11px; color: var(--muted); padding: 12px; background: var(--bg); border-radius: 8px; border: 1px solid var(--border); line-height: 2; }
+#stats span { color: var(--accent2); }
+.skills-list { max-height: 150px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+.skill-tag { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; font-size: 12px; animation: fadeIn .3s ease; }
+@keyframes fadeIn { from { opacity:0; transform: translateX(-10px); } to { opacity:1; } }
+.skill-tag .skill-name { color: var(--accent2); font-weight: 500; }
+.skill-tag .skill-remove { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 14px; padding: 2px 6px; border-radius: 4px; transition: all .2s; }
+.skill-tag .skill-remove:hover { color: var(--danger); background: rgba(239,68,68,.1); }
+
+/* ── Modals ── */
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.75); display: flex; align-items: center; justify-content: center; z-index: 1000; opacity: 0; visibility: hidden; transition: all .3s; }
+.modal-overlay.active { opacity: 1; visibility: visible; }
+.modal { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 24px; width: 90%; max-width: 420px; transform: scale(.9); transition: transform .3s; }
+.modal-overlay.active .modal { transform: scale(1); }
+.modal h2 { font-family: 'Syne', sans-serif; font-size: 18px; margin-bottom: 16px; }
+.modal-input { width: 100%; padding: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-family: 'JetBrains Mono', monospace; font-size: 13px; margin-bottom: 16px; outline: none; }
+.modal-input:focus { border-color: var(--accent3); }
+.modal-buttons { display: flex; gap: 10px; justify-content: flex-end; }
+
+/* ── WAR ROOM MODAL ── */
+#warroom-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.9);
+  z-index: 2000; opacity: 0; visibility: hidden; transition: all .3s;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+#warroom-overlay.active { opacity: 1; visibility: visible; }
+#warroom-header {
+  padding: 20px 30px; border-bottom: 1px solid rgba(249,115,22,.3);
+  display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+  background: linear-gradient(90deg, rgba(220,38,38,.05), rgba(249,115,22,.05));
+}
+#warroom-header h2 {
+  font-family: 'Syne', sans-serif; font-size: 20px; font-weight: 800;
+  background: linear-gradient(135deg, #dc2626, var(--war));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+#warroom-close {
+  background: none; border: 1px solid rgba(249,115,22,.4); border-radius: 8px;
+  color: var(--war); padding: 6px 12px; cursor: pointer; font-size: 13px;
+  transition: all .2s; font-family: 'Syne', sans-serif; font-weight: 600;
+}
+#warroom-close:hover { background: rgba(249,115,22,.1); }
+#warroom-body { flex: 1; overflow-y: auto; padding: 24px 30px; display: flex; flex-direction: column; gap: 24px; }
+
+/* Progress bar */
+#warroom-progress { display: flex; align-items: center; gap: 0; }
+.progress-step {
+  flex: 1; text-align: center; padding: 12px 8px; font-size: 11px;
+  font-family: 'Syne', sans-serif; font-weight: 600; letter-spacing: 0.5px;
+  border: 1px solid var(--border); color: var(--muted);
+  position: relative; transition: all .4s;
+}
+.progress-step:first-child { border-radius: 8px 0 0 8px; }
+.progress-step:last-child  { border-radius: 0 8px 8px 0; }
+.progress-step.active  { background: rgba(249,115,22,.15); border-color: var(--war); color: var(--war); }
+.progress-step.done    { background: rgba(34,197,94,.1); border-color: var(--success); color: var(--success); }
+
+/* Expert cards */
+#experts-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.expert-card {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 12px;
+  padding: 16px; text-align: center; transition: all .4s;
+}
+.expert-card.thinking {
+  border-color: var(--war);
+  box-shadow: 0 0 20px rgba(249,115,22,.2);
+  animation: expertPulse 1.5s ease-in-out infinite;
+}
+.expert-card.done {
+  border-color: var(--success);
+  box-shadow: 0 0 12px rgba(34,197,94,.15);
+  animation: none;
+}
+@keyframes expertPulse {
+  0%,100% { box-shadow: 0 0 10px rgba(249,115,22,.2); }
+  50%      { box-shadow: 0 0 30px rgba(249,115,22,.5); }
+}
+.expert-emoji {
+  font-size: 36px; display: block; margin-bottom: 10px;
+  filter: grayscale(1); transition: filter .4s;
+}
+.expert-card.thinking .expert-emoji { filter: none; animation: spin 3s linear infinite; }
+.expert-card.done .expert-emoji { filter: none; animation: none; }
+@keyframes spin { 0%,100% { transform: scale(1); } 50% { transform: scale(1.2); } }
+.expert-role { font-family: 'Syne', sans-serif; font-size: 12px; font-weight: 700; color: var(--text); margin-bottom: 4px; }
+.expert-specialty { font-size: 10px; color: var(--muted); line-height: 1.4; }
+.expert-status { font-size: 10px; margin-top: 8px; padding: 3px 8px; border-radius: 20px; display: inline-block; }
+.expert-status.thinking { background: rgba(249,115,22,.15); color: var(--war); }
+.expert-status.done     { background: rgba(34,197,94,.15); color: var(--success); }
+.expert-status.waiting  { background: rgba(100,116,139,.1); color: var(--muted); }
+
+/* Thought trace */
+#thought-trace {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 12px;
+  padding: 16px; max-height: 180px; overflow-y: auto;
+}
+#thought-trace h3 { font-family: 'Syne', sans-serif; font-size: 12px; font-weight: 700; color: var(--muted); margin-bottom: 10px; letter-spacing: 1px; text-transform: uppercase; }
+.thought-line { font-size: 11px; color: var(--muted); padding: 4px 0; border-bottom: 1px solid rgba(30,45,69,.5); display: flex; gap: 8px; align-items: baseline; }
+.thought-line:last-child { border-bottom: none; }
+.thought-line .tl-time { color: #334155; flex-shrink: 0; }
+.thought-line .tl-text { color: var(--text); }
+.thought-line.highlight .tl-text { color: var(--war); }
+
+/* Proposals tabs */
+#proposals-section h3 { font-family: 'Syne', sans-serif; font-size: 14px; font-weight: 700; color: var(--text); margin-bottom: 12px; }
+.proposal-tabs { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+.ptab { padding: 6px 14px; border-radius: 20px; border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 12px; cursor: pointer; transition: all .2s; font-family: 'JetBrains Mono', monospace; }
+.ptab.active { background: rgba(249,115,22,.15); border-color: var(--war); color: var(--war); }
+.proposal-content { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 16px; font-size: 13px; line-height: 1.7; display: none; }
+.proposal-content.active { display: block; }
+.proposal-content h1,.proposal-content h2,.proposal-content h3 { font-family: 'Syne', sans-serif; margin: 10px 0 6px; }
+.proposal-content ul,.proposal-content ol { padding-left: 18px; margin: 8px 0; }
+.proposal-content li { margin-bottom: 4px; }
+.proposal-content strong { color: #fff; }
+.proposal-content code { background: rgba(59,130,246,.15); color: var(--accent2); padding: 2px 6px; border-radius: 4px; font-size: 11px; }
+
+/* Synthesis */
+#synthesis-section { background: linear-gradient(135deg, rgba(220,38,38,.05), rgba(249,115,22,.05)); border: 1px solid rgba(249,115,22,.3); border-radius: 12px; padding: 20px; }
+#synthesis-section h3 { font-family: 'Syne', sans-serif; font-size: 16px; font-weight: 800; color: var(--war); margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+#synthesis-content { font-size: 13px; line-height: 1.8; color: var(--text); }
+#synthesis-content h1,#synthesis-content h2,#synthesis-content h3 { font-family: 'Syne', sans-serif; margin: 12px 0 8px; color: #fff; }
+#synthesis-content ul,#synthesis-content ol { padding-left: 18px; margin: 8px 0; }
+#synthesis-content li { margin-bottom: 5px; }
+#synthesis-content strong { color: #fff; }
+#synthesis-content blockquote { border-left: 3px solid var(--war); padding-left: 12px; color: var(--muted); margin: 8px 0; }
+.synthesis-actions { display: flex; gap: 10px; margin-top: 16px; }
+
+/* ── ADVOCATE MODAL ── */
+#advocate-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.88);
+  z-index: 2000; opacity: 0; visibility: hidden; transition: all .3s;
+  display: flex; align-items: center; justify-content: center;
+}
+#advocate-overlay.active { opacity: 1; visibility: visible; }
+#advocate-modal {
+  background: var(--panel); border: 1px solid rgba(139,92,246,.4);
+  border-radius: 20px; width: 90%; max-width: 700px; max-height: 88vh;
+  display: flex; flex-direction: column; overflow: hidden;
+  box-shadow: 0 0 60px rgba(139,92,246,.2);
+}
+#advocate-header {
+  padding: 20px 24px; border-bottom: 1px solid rgba(139,92,246,.3);
+  display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+}
+#advocate-header h2 { font-family: 'Syne', sans-serif; font-size: 18px; font-weight: 800; }
+#advocate-body { flex: 1; overflow-y: auto; padding: 20px 24px; }
+#advocate-input-area { padding: 16px 24px; border-top: 1px solid var(--border); display: flex; gap: 10px; flex-shrink: 0; }
+#advocate-input-area textarea { flex: 1; min-height: 50px; max-height: 100px; padding: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; color: var(--text); font-family: 'JetBrains Mono', monospace; font-size: 13px; resize: none; outline: none; }
+#advocate-input-area textarea:focus { border-color: var(--accent3); }
+.critique-content { font-size: 13px; line-height: 1.8; }
+.critique-content h1,.critique-content h2,.critique-content h3 { font-family: 'Syne', sans-serif; margin: 14px 0 8px; color: #fff; }
+.critique-content ul,.critique-content ol { padding-left: 18px; margin: 8px 0; }
+.critique-content li { margin-bottom: 5px; }
+.critique-content strong { color: #fff; }
+
+
+
+/* ── WAR ROOM mode buttons ── */
+.wr-mode-btn.active { background: rgba(249,115,22,.2) !important; color: var(--war) !important; }
+
+/* ── Files chips ── */
+.wr-file-chip {
+  display:flex; align-items:center; gap:6px;
+  padding:5px 10px; border-radius:8px;
+  border:1px solid var(--border); background:var(--bg);
+  font-size:11px; cursor:pointer; transition:all .2s;
+  font-family:'JetBrains Mono',monospace;
+}
+.wr-file-chip:hover { border-color:rgba(74,222,128,.4); }
+.wr-file-chip.valid { border-color:rgba(34,197,94,.3); color:#4ade80; }
+.wr-file-chip.invalid { border-color:rgba(239,68,68,.3); color:var(--danger); }
+.wr-file-chip .fc-lang { font-size:9px; color:var(--muted); }
+.wr-file-chip .fc-lines { font-size:9px; color:var(--muted); }
+
+/* ── Star feedback ── */
+.wr-star {
+  background:none; border:none; font-size:22px; cursor:pointer;
+  opacity:.35; transition:all .15s; padding:2px;
+}
+.wr-star.active, .wr-star:hover { opacity:1; transform:scale(1.15); }
+
+/* ── Spinner in warroom buttons ── */
+#wr-launch-btn .spinner, #wr-refine-btn .spinner {
+  width:12px;height:12px;border:2px solid rgba(255,255,255,.3);
+  border-top-color:#fff;border-radius:50%;animation:spin2 .8s linear infinite;
+  display:inline-block;vertical-align:middle;
+}
+@keyframes spin2 { to { transform:rotate(360deg); } }
+  background: none; border: 1px solid var(--border); border-radius: 8px;
+  color: var(--muted); padding: 6px 12px; cursor: pointer; font-size: 13px;
+  transition: all .2s; font-family: 'Syne', sans-serif; font-weight: 600;
+}
+.modal-close-btn:hover { border-color: var(--text); color: var(--text); }
+
+/* ── Special toolbar buttons ── */
+.special-tools {
+  display: flex; gap: 6px; flex-wrap: wrap; padding: 8px 24px 0;
+  border-top: 1px solid var(--border);
+}
+.tool-btn {
+  padding: 6px 12px; border-radius: 8px; border: 1px solid var(--border);
+  background: transparent; color: var(--muted); font-size: 11px;
+  cursor: pointer; transition: all .2s; font-family: 'Syne', sans-serif;
+  font-weight: 600; display: flex; align-items: center; gap: 5px; white-space: nowrap;
+}
+.tool-btn:hover { transform: translateY(-1px); }
+.tool-btn.war     { border-color: rgba(249,115,22,.5); color: var(--war); }
+.tool-btn.war:hover { background: rgba(249,115,22,.1); }
+.tool-btn.devil   { border-color: rgba(139,92,246,.5); color: var(--accent3); }
+.tool-btn.devil:hover { background: rgba(139,92,246,.1); }
+
+/* ── Expert selector chips ── */
+.expert-chip {
+  padding: 5px 12px; border-radius: 20px;
+  border: 1px solid var(--border); background: transparent;
+  color: var(--muted); font-size: 11px; cursor: pointer;
+  transition: all .2s; font-family: 'Syne', sans-serif; font-weight: 600;
+}
+.expert-chip:hover { border-color: rgba(249,115,22,.5); color: var(--text); }
+.expert-chip.selected {
+  background: rgba(249,115,22,.15);
+  border-color: rgba(249,115,22,.7);
+  color: var(--war);
+}
+
+/* ── Expert Catalog (War Room) ── */
+#expert-catalog { display: flex; flex-direction: column; gap: 10px; }
+.family-group {}
+.family-header {
+  display: flex; align-items: center; gap: 8px;
+  font-family: 'Syne', sans-serif; font-size: 11px; font-weight: 700;
+  letter-spacing: 1px; text-transform: uppercase; padding: 6px 0;
+  cursor: pointer; user-select: none; border-bottom: 1px solid var(--border);
+  margin-bottom: 8px; transition: color .2s;
+}
+.family-header:hover { color: var(--text); }
+.family-toggle { margin-left: auto; font-size: 10px; color: var(--muted); transition: transform .25s; }
+.family-group.collapsed .family-toggle { transform: rotate(-90deg); }
+.family-group.collapsed .family-cards { display: none; }
+.family-cards { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 4px; }
+
+/* Draggable expert mini-card */
+.expert-mini-card {
+  display: flex; flex-direction: column; gap: 3px;
+  width: 140px; padding: 10px 12px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+  cursor: grab; transition: all .2s; user-select: none;
+  position: relative;
+}
+.expert-mini-card:hover { border-color: rgba(249,115,22,.5); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,.3); }
+.expert-mini-card:active { cursor: grabbing; transform: scale(.96); }
+.expert-mini-card.dragging { opacity: .4; border-color: var(--war); }
+.expert-mini-card .emc-top { display: flex; align-items: center; gap: 6px; }
+.expert-mini-card .emc-emoji { font-size: 18px; }
+.expert-mini-card .emc-role { font-family: 'Syne', sans-serif; font-size: 11px; font-weight: 700; color: var(--text); line-height: 1.2; }
+.expert-mini-card .emc-desc { font-size: 10px; color: var(--muted); line-height: 1.3; }
+.expert-mini-card .emc-detail-btn {
+  position: absolute; top: 5px; right: 6px;
+  background: none; border: none; color: var(--muted); font-size: 12px;
+  cursor: pointer; padding: 2px 4px; border-radius: 4px; transition: all .15s;
+  line-height: 1;
+}
+.expert-mini-card .emc-detail-btn:hover { color: var(--accent2); background: rgba(6,182,212,.1); }
+
+/* Drop zone */
+#expert-drop-zone {
+  min-height: 80px; border: 2px dashed rgba(249,115,22,.35); border-radius: 12px;
+  padding: 12px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  transition: all .25s; background: rgba(249,115,22,.03);
+  position: relative;
+}
+#expert-drop-zone.drag-over { border-color: var(--war); background: rgba(249,115,22,.1); box-shadow: 0 0 20px rgba(249,115,22,.2); }
+#expert-drop-zone.full { border-color: var(--success); background: rgba(34,197,94,.04); }
+#drop-placeholder {
+  color: var(--muted); font-size: 11px; text-align: center;
+  width: 100%; pointer-events: none;
+}
+
+/* Selected expert slot */
+.expert-slot {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; background: rgba(249,115,22,.12);
+  border: 1px solid rgba(249,115,22,.5); border-radius: 8px;
+  font-size: 11px; font-family: 'Syne', sans-serif; font-weight: 600; color: var(--war);
+  animation: slotIn .2s ease;
+}
+@keyframes slotIn { from { opacity: 0; transform: scale(.8); } to { opacity: 1; transform: scale(1); } }
+.expert-slot .slot-remove {
+  background: none; border: none; color: var(--muted); cursor: pointer;
+  font-size: 13px; padding: 0 2px; margin-left: 4px; border-radius: 4px;
+  transition: color .15s; line-height: 1;
+}
+.expert-slot .slot-remove:hover { color: var(--danger); }
+
+/* Expert detail modal */
+#expert-detail-modal {
+  position: fixed; inset: 0; z-index: 3000;
+  background: rgba(0,0,0,.75); display: flex; align-items: center; justify-content: center;
+  opacity: 0; visibility: hidden; transition: all .2s;
+}
+#expert-detail-modal.active { opacity: 1; visibility: visible; }
+#expert-detail-box {
+  background: var(--panel); border: 1px solid rgba(249,115,22,.4); border-radius: 16px;
+  padding: 28px 28px 24px; width: 90%; max-width: 420px;
+  transform: scale(.9); transition: transform .2s;
+}
+#expert-detail-modal.active #expert-detail-box { transform: scale(1); }
+#expert-detail-box .edb-emoji { font-size: 42px; display: block; margin-bottom: 10px; }
+#expert-detail-box .edb-role { font-family: 'Syne', sans-serif; font-size: 18px; font-weight: 800; margin-bottom: 4px; }
+#expert-detail-box .edb-family { font-size: 11px; color: var(--muted); margin-bottom: 14px; letter-spacing: .5px; }
+#expert-detail-box .edb-specialty { font-size: 13px; color: var(--text); line-height: 1.7; margin-bottom: 20px; }
+#expert-detail-box .edb-actions { display: flex; gap: 10px; }
+#expert-detail-box .edb-add { flex: 1; padding: 10px; border: none; border-radius: 8px; background: linear-gradient(135deg,#dc2626,var(--war)); color:#fff; font-family:'Syne',sans-serif; font-weight:700; font-size:13px; cursor:pointer; transition:opacity .2s; }
+#expert-detail-box .edb-add:disabled { opacity: .4; cursor: not-allowed; }
+#expert-detail-box .edb-close { padding: 10px 16px; border: 1px solid var(--border); border-radius: 8px; background: transparent; color: var(--muted); font-family:'Syne',sans-serif; font-weight:600; font-size:13px; cursor:pointer; transition:all .2s; }
+#expert-detail-box .edb-close:hover { border-color: var(--accent); color: var(--accent); }
+
+
+/* ── Language selector ── */
+#lang-select {
+  padding: 5px 10px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--text);
+  font-family: 'JetBrains Mono', monospace; font-size: 11px; outline: none; cursor: pointer;
+  transition: border-color .2s;
+}
+#lang-select:hover, #lang-select:focus { border-color: var(--accent2); }
+
+/* ── Chef de Projet card (War Room) ── */
+#pm-section {
+  background: linear-gradient(135deg, rgba(6,182,212,.06), rgba(59,130,246,.06));
+  border: 1px solid rgba(6,182,212,.35); border-radius: 12px; padding: 16px;
+  margin-bottom: 4px;
+}
+#pm-section h3 { font-family: 'Syne', sans-serif; font-size: 13px; font-weight: 700; color: var(--accent2); margin-bottom: 10px; display:flex; align-items:center; gap:6px; }
+.pm-objective { font-size: 13px; color: var(--text); margin-bottom: 10px; line-height: 1.6; }
+.pm-steps { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.pm-step { display: flex; align-items:center; gap: 8px; font-size: 12px; background: rgba(0,0,0,.2); border-radius: 8px; padding: 6px 10px; }
+.pm-step .step-num { background: var(--accent2); color: #000; border-radius: 50%; width: 18px; height: 18px; display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:700; flex-shrink:0; }
+.pm-step .step-prio { font-size: 10px; padding: 2px 6px; border-radius: 10px; flex-shrink:0; }
+.pm-step .step-prio.haute   { background: rgba(239,68,68,.2); color: #f87171; }
+.pm-step .step-prio.moyenne { background: rgba(245,158,11,.2); color: #fbbf24; }
+.pm-step .step-prio.basse   { background: rgba(34,197,94,.2); color: #4ade80; }
+.pm-step .step-dur { color: var(--muted); font-size: 10px; margin-left: auto; }
+.pm-risks { display:flex; gap:6px; flex-wrap:wrap; }
+.pm-risk-tag { font-size: 10px; padding: 3px 8px; border-radius: 10px; background: rgba(239,68,68,.1); border: 1px solid rgba(239,68,68,.3); color: #f87171; }
+
+/* ── User menu ── */
+.user-menu-wrapper { position: relative; }
+.user-avatar-btn {
+  display: flex; align-items: center; gap: 8px;
+  background: rgba(59,130,246,.1); border: 1px solid rgba(59,130,246,.3);
+  border-radius: 10px; padding: 6px 12px; cursor: pointer; transition: all .2s;
+  font-size: 12px; color: var(--accent); font-family: 'JetBrains Mono', monospace;
+  outline: none;
+}
+.user-avatar-btn:hover { background: rgba(59,130,246,.2); }
+.avatar-circle {
+  width: 26px; height: 26px; border-radius: 8px;
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700; color: #fff; font-family: 'Syne', sans-serif;
+}
+.user-dropdown {
+  position: absolute; top: calc(100% + 8px); right: 0;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 12px; padding: 8px; min-width: 210px;
+  box-shadow: 0 12px 40px rgba(0,0,0,.5); z-index: 200;
+  opacity: 0; visibility: hidden; transform: translateY(-6px); transition: all .2s;
+}
+.user-dropdown.open { opacity: 1; visibility: visible; transform: none; }
+.user-dropdown-header { padding: 10px 12px 14px; border-bottom: 1px solid var(--border); margin-bottom: 8px; }
+.user-dropdown-header .uname { font-family: 'Syne', sans-serif; font-weight: 700; font-size: 14px; color: var(--text); }
+.user-dropdown-header .uemail { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.dropdown-item {
+  display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+  border-radius: 8px; cursor: pointer; font-size: 12px; color: var(--muted);
+  transition: all .2s; border: none; background: none; width: 100%; text-align: left;
+}
+.dropdown-item:hover { background: rgba(255,255,255,.05); color: var(--text); }
+.dropdown-item.danger { color: var(--danger); }
+.dropdown-item.danger:hover { background: rgba(239,68,68,.1); }
+
+.login-btn-topbar {
+  display: flex; align-items: center; gap: 6px; padding: 7px 14px;
+  border-radius: 10px; border: 1px solid var(--border); background: transparent;
+  color: var(--muted); font-family: 'Syne', sans-serif;
+  font-size: 12px; font-weight: 600; cursor: pointer; transition: all .2s;
+}
+.login-btn-topbar:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ── Layout ── */
+#app-wrapper { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+#topbar { padding: 12px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+#topbar-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+#model-badge { font-size: 11px; padding: 4px 10px; border-radius: 20px; background: rgba(59,130,246,.15); color: var(--accent); border: 1px solid rgba(59,130,246,.3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
+#context-indicator { font-size: 11px; color: var(--success); display: none; align-items: center; gap: 5px; }
+#context-indicator::before { content: '●'; animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+#skills-indicator { font-size: 11px; color: var(--accent3); display: none; align-items: center; gap: 5px; }
+#sidebar-toggle { display: none; background: none; border: none; cursor: pointer; color: var(--text); padding: 4px; font-size: 18px; }
+
+/* ── Messages ── */
+#messages { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 20px; scroll-behavior: smooth; }
+.msg-wrapper { display: flex; gap: 12px; max-width: 85%; animation: slideIn .25s ease; }
+@keyframes slideIn { from { opacity:0; transform: translateY(8px); } to { opacity:1; } }
+.msg-wrapper.user { flex-direction: row-reverse; align-self: flex-end; }
+.msg-wrapper.bot  { align-self: flex-start; }
+.avatar { width: 34px; height: 34px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 16px; flex-shrink: 0; margin-top: 2px; }
+.avatar.user { background: var(--user-bg); }
+.avatar.bot  { background: linear-gradient(135deg, var(--accent), var(--accent2)); }
+.bubble { padding: 14px 18px; border-radius: var(--radius); font-size: 13.5px; line-height: 1.7; max-width: 100%; }
+.bubble.user { background: var(--user-bg); border-top-right-radius: 4px; color: #c7d9f8; }
+.bubble.bot  { background: var(--bot-bg); border-top-left-radius: 4px; border: 1px solid var(--border); }
+.bubble.bot p { margin-bottom: 10px; }
+.bubble.bot p:last-child { margin-bottom: 0; }
+.bubble.bot h1,.bubble.bot h2,.bubble.bot h3 { font-family: 'Syne', sans-serif; margin: 14px 0 8px; color: #fff; }
+.bubble.bot ul,.bubble.bot ol { padding-left: 20px; margin: 8px 0; }
+.bubble.bot li { margin-bottom: 4px; }
+.bubble.bot code:not(pre code) { background: rgba(59,130,246,.15); color: var(--accent2); padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+.bubble.bot pre { background: #0d1117; border-radius: 8px; padding: 14px; overflow-x: auto; margin: 10px 0; border: 1px solid var(--border); }
+.bubble.bot pre code { font-size: 12px; }
+.bubble.bot blockquote { border-left: 3px solid var(--accent); padding-left: 12px; color: var(--muted); margin: 8px 0; }
+.bubble.bot table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 12px; }
+.bubble.bot th { background: rgba(59,130,246,.15); padding: 8px 12px; text-align: left; }
+.bubble.bot td { padding: 7px 12px; border-bottom: 1px solid var(--border); }
+.msg-time { font-size: 10px; color: var(--muted); margin-top: 5px; padding: 0 4px; }
+
+/* Mermaid diagram in chat */
+.mermaid-wrapper { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin: 10px 0; overflow-x: auto; }
+.mermaid-wrapper .mermaid { display: block; }
+
+/* ── Typing ── */
+#typing { display: none; align-self: flex-start; gap: 12px; align-items: center; }
+#typing.visible { display: flex; }
+.typing-dots { background: var(--bot-bg); border: 1px solid var(--border); border-radius: var(--radius); border-top-left-radius: 4px; padding: 14px 18px; display: flex; gap: 5px; align-items: center; }
+.typing-dots span { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: bounce 1.2s infinite; }
+.typing-dots span:nth-child(2) { animation-delay: .2s; }
+.typing-dots span:nth-child(3) { animation-delay: .4s; }
+@keyframes bounce { 0%,60%,100%{transform:translateY(0)} 30%{transform:translateY(-7px)} }
+
+/* ── Welcome ── */
+#welcome { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--muted); text-align: center; padding: 40px; }
+#welcome h2 { font-family: 'Syne', sans-serif; font-size: 28px; font-weight: 800; color: var(--text); }
+#welcome p  { font-size: 13px; line-height: 1.8; max-width: 400px; }
+#welcome .hint { font-size: 11px; color: #334155; margin-top: 12px; }
+#welcome .features { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; justify-content: center; }
+#welcome .feature-pill { padding: 6px 14px; border-radius: 20px; border: 1px solid var(--border); font-size: 11px; color: var(--muted); background: var(--panel); }
+#welcome .feature-pill.war { border-color: rgba(249,115,22,.4); color: var(--war); background: rgba(249,115,22,.05); }
+#welcome .feature-pill.devil { border-color: rgba(139,92,246,.4); color: var(--accent3); background: rgba(139,92,246,.05); }
+#welcome .feature-pill.time { border-color: rgba(6,182,212,.4); color: var(--accent2); background: rgba(6,182,212,.05); }
+#welcome .feature-pill.tree { border-color: rgba(59,130,246,.4); color: var(--accent); background: rgba(59,130,246,.05); }
+
+/* ── Input area ── */
+#input-area { padding: 16px 24px 4px; border-top: 1px solid var(--border); display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; flex-shrink: 0; }
+#file-attach-area { width: 100%; display: none; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+#file-attach-area.visible { display: flex; }
+.file-chip { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font-size: 11px; display: flex; align-items: center; gap: 6px; color: var(--accent2); }
+.file-chip .remove { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 14px; padding: 0 2px; transition: color .2s; }
+.file-chip .remove:hover { color: var(--danger); }
+#message-input { flex: 1; min-height: 50px; max-height: 160px; padding: 14px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); font-family: 'JetBrains Mono', monospace; font-size: 13.5px; resize: none; outline: none; transition: border-color .2s; line-height: 1.5; }
+#message-input:focus { border-color: var(--accent); }
+#message-input::placeholder { color: var(--muted); }
+.action-btn { width: 50px; height: 50px; border-radius: 12px; border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: transform .15s, opacity .15s; flex-shrink: 0; }
+#attach-btn { background: var(--bg); color: var(--muted); }
+#attach-btn:hover { color: var(--accent); transform: scale(1.05); }
+#send-btn { background: linear-gradient(135deg, var(--accent), var(--accent2)); }
+#send-btn:hover:not(:disabled) { transform: scale(1.05); }
+#send-btn:disabled { opacity: .4; cursor: not-allowed; }
+.action-btn svg { width: 20px; height: 20px; fill: currentColor; }
+
+/* ── Toast ── */
+#toast { position: fixed; bottom: 30px; right: 30px; background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 12px 20px; border-radius: 10px; font-size: 13px; transform: translateY(80px); opacity: 0; transition: all .3s; z-index: 9999; pointer-events: none; }
+#toast.show    { transform: none; opacity: 1; }
+#toast.success { border-color: var(--success); color: var(--success); }
+#toast.error   { border-color: var(--danger);  color: var(--danger); }
+#toast.warn    { border-color: var(--warn);    color: var(--warn); }
+
+/* Loading spinner */
+.spinner { width: 24px; height: 24px; border: 2px solid var(--border); border-top-color: var(--war); border-radius: 50%; animation: rotate 0.8s linear infinite; display: inline-block; }
+@keyframes rotate { to { transform: rotate(360deg); } }
+
+@media (max-width: 768px) {
+  #sidebar { position: absolute; z-index: 50; height: 100%; transform: translateX(-100%); }
+  #sidebar.open { transform: none; }
+  #sidebar-toggle { display: block; }
+  #experts-grid { grid-template-columns: 1fr; }
+}
+
+/* ── IDE PYTHON ── */
+#ide-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.9);
+  z-index: 2000; opacity: 0; visibility: hidden; transition: all .3s;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+#ide-overlay.active { opacity: 1; visibility: visible; }
+#ide-header {
+  padding: 14px 24px; border-bottom: 1px solid rgba(22,163,74,.3);
+  display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+  background: linear-gradient(90deg, rgba(22,163,74,.07), rgba(21,128,61,.05));
+}
+#ide-header h2 {
+  font-family: 'Syne', sans-serif; font-size: 18px; font-weight: 800;
+  background: linear-gradient(135deg, #4ade80, #16a34a);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+  display: flex; align-items: center; gap: 10px;
+}
+#ide-close {
+  background: none; border: 1px solid rgba(22,163,74,.4); border-radius: 8px;
+  color: #4ade80; padding: 6px 14px; cursor: pointer; font-size: 13px;
+  transition: all .2s; font-family: 'Syne', sans-serif; font-weight: 600;
+}
+#ide-close:hover { background: rgba(22,163,74,.1); }
+#ide-body {
+  flex: 1; display: flex; overflow: hidden; gap: 0;
+}
+#ide-left {
+  display: flex; flex-direction: column; flex: 1; border-right: 1px solid var(--border); overflow: hidden;
+}
+#ide-toolbar {
+  display: flex; align-items: center; gap: 8px; padding: 10px 16px;
+  border-bottom: 1px solid var(--border); flex-shrink: 0;
+  background: var(--panel);
+}
+#ide-toolbar .ide-filename {
+  font-size: 12px; color: var(--muted); font-family: 'JetBrains Mono', monospace;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 5px 10px; outline: none; color: var(--text); width: 160px;
+}
+#ide-toolbar .ide-filename:focus { border-color: #4ade80; }
+#ide-run-btn {
+  padding: 7px 18px; background: linear-gradient(135deg, #16a34a, #15803d);
+  border: none; border-radius: 8px; color: #fff;
+  font-family: 'Syne', sans-serif; font-weight: 700; font-size: 13px;
+  cursor: pointer; transition: opacity .2s; display: flex; align-items: center; gap: 6px;
+}
+#ide-run-btn:hover:not(:disabled) { opacity: .88; }
+#ide-run-btn:disabled { opacity: .4; cursor: not-allowed; }
+#ide-clear-btn {
+  padding: 7px 14px; background: transparent; border: 1px solid var(--border);
+  border-radius: 8px; color: var(--muted); font-family: 'Syne', sans-serif;
+  font-weight: 600; font-size: 12px; cursor: pointer; transition: all .2s;
+}
+#ide-clear-btn:hover { border-color: var(--danger); color: var(--danger); }
+#ide-send-chat-btn {
+  padding: 7px 14px; background: transparent; border: 1px solid rgba(59,130,246,.4);
+  border-radius: 8px; color: var(--accent); font-family: 'Syne', sans-serif;
+  font-weight: 600; font-size: 12px; cursor: pointer; transition: all .2s; margin-left: auto;
+}
+#ide-send-chat-btn:hover { background: rgba(59,130,246,.1); }
+#ide-editor-wrap {
+  flex: 1; overflow: hidden; position: relative;
+}
+#ide-editor {
+  width: 100%; height: 100%; padding: 16px; resize: none; outline: none;
+  background: #0d1117; color: #e6edf3;
+  border: none; font-family: 'JetBrains Mono', monospace; font-size: 13px;
+  line-height: 1.65; tab-size: 4;
+  white-space: pre; overflow-wrap: normal; overflow-x: auto;
+}
+#ide-output-panel {
+  height: 220px; flex-shrink: 0; border-top: 1px solid var(--border);
+  display: flex; flex-direction: column; background: #0a0f1e;
+}
+#ide-pkg-panel { display: none; }
+#ide-output-tabs {
+  display: flex; gap: 0; border-bottom: 1px solid var(--border); flex-shrink: 0;
+}
+.ide-otab {
+  padding: 7px 16px; font-size: 11px; font-family: 'Syne', sans-serif; font-weight: 700;
+  border: none; background: transparent; color: var(--muted); cursor: pointer;
+  border-bottom: 2px solid transparent; transition: all .2s; letter-spacing: .3px;
+}
+.ide-otab.active { color: #4ade80; border-bottom-color: #4ade80; }
+.ide-otab.error  { color: var(--danger); }
+#ide-output-content {
+  flex: 1; overflow-y: auto; padding: 12px 16px;
+  font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.7;
+  color: #c9d1d9;
+}
+#ide-output-content .out-success { color: #4ade80; }
+#ide-output-content .out-error   { color: #f87171; }
+#ide-output-content .out-meta    { color: var(--muted); font-size: 10px; }
+#ide-output-content .out-empty   { color: #334155; font-style: italic; }
+
+/* IDE RIGHT — AI assistant */
+#ide-right {
+  width: 360px; min-width: 300px; display: flex; flex-direction: column;
+  background: var(--panel); overflow: hidden;
+}
+#ide-ai-header {
+  padding: 12px 16px; border-bottom: 1px solid var(--border); flex-shrink: 0;
+  font-family: 'Syne', sans-serif; font-size: 12px; font-weight: 700;
+  color: var(--accent2); letter-spacing: .5px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+#ide-ai-messages {
+  flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px;
+}
+.ide-ai-msg {
+  padding: 10px 14px; border-radius: 10px; font-size: 12px; line-height: 1.65;
+  animation: fadeIn .25s ease;
+}
+.ide-ai-msg.user { background: var(--user-bg); color: #c7d9f8; align-self: flex-end; max-width: 90%; border-top-right-radius: 3px; }
+.ide-ai-msg.bot  { background: var(--bg); border: 1px solid var(--border); align-self: flex-start; max-width: 95%; border-top-left-radius: 3px; }
+.ide-ai-msg.bot code { background: rgba(59,130,246,.15); color: var(--accent2); padding: 1px 5px; border-radius: 3px; font-size: 11px; }
+.ide-ai-msg.bot pre  { background: #0d1117; border-radius: 6px; padding: 10px; overflow-x: auto; margin: 6px 0; border: 1px solid var(--border); font-size: 11px; }
+.ide-ai-insert-btn {
+  margin-top: 6px; padding: 4px 10px; font-size: 10px; border-radius: 6px;
+  border: 1px solid rgba(74,222,128,.4); background: transparent; color: #4ade80;
+  cursor: pointer; font-family: 'Syne', sans-serif; font-weight: 700; transition: all .2s;
+}
+.ide-ai-insert-btn:hover { background: rgba(74,222,128,.1); }
+#ide-ai-input-area {
+  padding: 12px; border-top: 1px solid var(--border); flex-shrink: 0; display: flex; flex-direction: column; gap: 8px;
+}
+#ide-ai-quick-btns {
+  display: flex; gap: 6px; flex-wrap: wrap;
+}
+.ide-quick-btn {
+  padding: 4px 10px; border-radius: 6px; border: 1px solid var(--border);
+  background: transparent; color: var(--muted); font-size: 10px;
+  cursor: pointer; transition: all .15s; font-family: 'Syne', sans-serif; font-weight: 600;
+  white-space: nowrap;
+}
+.ide-quick-btn:hover { border-color: var(--accent2); color: var(--accent2); }
+#ide-ai-input-row { display: flex; gap: 8px; }
+#ide-ai-input {
+  flex: 1; padding: 9px 12px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; color: var(--text); font-family: 'JetBrains Mono', monospace;
+  font-size: 12px; outline: none; resize: none; min-height: 38px; max-height: 90px;
+  transition: border-color .2s;
+}
+#ide-ai-input:focus { border-color: var(--accent2); }
+#ide-ai-send-btn {
+  padding: 9px 14px; background: linear-gradient(135deg, var(--accent), var(--accent2));
+  border: none; border-radius: 8px; color: #fff; font-family: 'Syne', sans-serif;
+  font-weight: 700; font-size: 12px; cursor: pointer; transition: opacity .2s; white-space: nowrap;
+}
+#ide-ai-send-btn:hover:not(:disabled) { opacity: .88; }
+#ide-ai-send-btn:disabled { opacity: .4; cursor: not-allowed; }
+@media (max-width: 900px) {
+  #ide-right { display: none; }
+}
 </style>
 </head>
 <body>
-<div class="bg-blob bg-blob-1"></div>
-<div class="bg-blob bg-blob-2"></div>
-<div class="bg-blob bg-blob-3"></div>
-<div class="card">
-  <div class="logo">NeuralChat</div>
-  <div class="logo-sub">Powered by OpenRouter</div>
-  <div class="tabs">
-    <button class="tab-btn active" id="tab-login"    onclick="switchTab('login')">Connexion</button>
-    <button class="tab-btn"        id="tab-register" onclick="switchTab('register')">Créer un compte</button>
+
+<!-- ══════════════════════════════════════════════════════════
+     SKILL MODAL
+══════════════════════════════════════════════════════════ -->
+<div class="modal-overlay" id="skill-modal">
+  <div class="modal">
+    <h2>✨ Ajouter un Skill</h2>
+    <input type="text" class="modal-input" id="skill-input" placeholder="Ex: Python, Rédaction, Data Science…"/>
+    <div class="modal-buttons">
+      <button class="btn btn-ghost" onclick="closeSkillModal()">Annuler</button>
+      <button class="btn btn-secondary" onclick="addSkill()">Ajouter</button>
+    </div>
   </div>
-  <div id="form-login">
-    <div class="form-group"><label>Nom d'utilisateur</label><input type="text" id="login-username" placeholder="votre_pseudo" autocomplete="username"/></div>
-    <div class="form-group"><label>Mot de passe</label><input type="password" id="login-password" placeholder="••••••••" autocomplete="current-password"/></div>
-    <button class="submit-btn" id="login-btn" onclick="doLogin()">Se connecter →</button>
-    <div class="error-msg"   id="login-error"></div>
-    <div class="success-msg" id="login-success"></div>
-  </div>
-  <div id="form-register" style="display:none">
-    <div class="form-group"><label>Nom d'utilisateur <span style="color:var(--danger)">*</span></label><input type="text" id="reg-username" placeholder="votre_pseudo" autocomplete="username"/></div>
-    <div class="form-group"><label>Email <span style="color:var(--muted);font-size:10px;">(optionnel)</span></label><input type="email" id="reg-email" placeholder="you@example.com" autocomplete="email"/></div>
-    <div class="form-group"><label>Mot de passe <span style="color:var(--danger)">*</span> <span style="color:var(--muted);font-size:10px;">(min. 6 caractères)</span></label><input type="password" id="reg-password" placeholder="••••••••" autocomplete="new-password"/></div>
-    <div class="form-group"><label>Confirmer le mot de passe <span style="color:var(--danger)">*</span></label><input type="password" id="reg-confirm" placeholder="••••••••" autocomplete="new-password"/></div>
-    <button class="submit-btn" id="register-btn" onclick="doRegister()">Créer mon compte →</button>
-    <div class="error-msg"   id="register-error"></div>
-    <div class="success-msg" id="register-success"></div>
-  </div>
-  <div class="divider">ou</div>
-  <button class="guest-btn" onclick="window.location='/'">Continuer sans compte</button>
 </div>
+
+<!-- ══════════════════════════════════════════════════════════
+     ⚔️ WAR ROOM OVERLAY
+══════════════════════════════════════════════════════════ -->
+<div id="warroom-overlay">
+  <div id="warroom-header">
+    <h2>⚔️ War Room — Mode Multi-Agents</h2>
+    <button id="warroom-close" onclick="closeWarRoom()">✕ Fermer</button>
+  </div>
+  <div id="warroom-body">
+
+    <!-- Input -->
+    <div style="display:flex;gap:10px;align-items:flex-end;">
+      <textarea id="warroom-input" placeholder="Décris ton problème, projet ou question complexe…"
+        style="flex:1;min-height:70px;max-height:140px;padding:14px;background:var(--bg);border:1px solid rgba(249,115,22,.3);border-radius:10px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:13px;resize:none;outline:none;line-height:1.6;"></textarea>
+      <button onclick="launchWarRoom()" id="wr-launch-btn"
+        style="padding:14px 20px;background:linear-gradient(135deg,#dc2626,var(--war));border:none;border-radius:10px;color:#fff;font-family:'Syne',sans-serif;font-weight:700;font-size:13px;cursor:pointer;white-space:nowrap;transition:opacity .2s;">
+        🚀 Lancer
+      </button>
+    </div>
+
+    <!-- Mode & Options -->
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:-8px;">
+      <!-- Mode preset -->
+      <div style="display:flex;align-items:center;gap:6px;">
+        <span style="font-size:10px;color:var(--muted);font-family:'Syne',sans-serif;font-weight:700;letter-spacing:.5px;">MODE</span>
+        <div id="wr-mode-tabs" style="display:flex;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:3px;gap:2px;">
+          <button class="wr-mode-btn active" data-mode="fast"     onclick="setWarRoomMode('fast')"     style="padding:5px 12px;border:none;border-radius:6px;font-family:'Syne',sans-serif;font-size:11px;font-weight:700;cursor:pointer;background:rgba(249,115,22,.2);color:var(--war);transition:all .2s;" title="1 expert, rapide">⚡ Fast</button>
+          <button class="wr-mode-btn"        data-mode="balanced" onclick="setWarRoomMode('balanced')" style="padding:5px 12px;border:none;border-radius:6px;font-family:'Syne',sans-serif;font-size:11px;font-weight:700;cursor:pointer;background:transparent;color:var(--muted);transition:all .2s;" title="3 experts, reviewer, résumé">⚖️ Balanced</button>
+          <button class="wr-mode-btn"        data-mode="full"     onclick="setWarRoomMode('full')"     style="padding:5px 12px;border:none;border-radius:6px;font-family:'Syne',sans-serif;font-size:11px;font-weight:700;cursor:pointer;background:transparent;color:var(--muted);transition:all .2s;" title="5 experts, débat, tests, résumé">🔥 Full</button>
+        </div>
+      </div>
+      <!-- Stack override -->
+      <div style="display:flex;align-items:center;gap:6px;flex:1;min-width:160px;">
+        <span style="font-size:10px;color:var(--muted);font-family:'Syne',sans-serif;font-weight:700;letter-spacing:.5px;">STACK</span>
+        <input id="wr-stack" type="text" placeholder="ex: python/flask, typescript/react…"
+          style="flex:1;padding:6px 10px;font-size:11px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);outline:none;font-family:'JetBrains Mono',monospace;" />
+      </div>
+      <!-- Streaming toggle -->
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:11px;color:var(--muted);font-family:'Syne',sans-serif;font-weight:600;" title="Afficher les résultats en temps réel">
+        <input type="checkbox" id="wr-stream-toggle" checked style="accent-color:var(--war);width:13px;height:13px;" />
+        Live stream
+      </label>
+    </div>
+    <!-- Mode description -->
+    <div id="wr-mode-desc" style="font-size:10px;color:var(--muted);padding:4px 2px;font-family:'JetBrains Mono',monospace;">
+      ⚡ Fast — 1 expert, sans reviewer ni tests. Idéal pour les questions rapides.
+    </div>
+
+    <!-- Expert Selector (family catalog + drag & drop) -->
+    <div id="expert-selector-section" style="margin-top:4px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+        <div style="font-size:11px;color:var(--muted);letter-spacing:.5px;font-family:'Syne',sans-serif;font-weight:700;">
+          🎭 EXPERTS — <span style="color:var(--accent3);font-weight:400;">Glisse jusqu'à 3 experts dans la zone, ou laisse l'IA choisir</span>
+        </div>
+        <input id="expert-search" type="text" placeholder="🔍 Rechercher…"
+          style="width:150px;padding:5px 10px;font-size:11px;border-radius:8px;background:var(--bg);border:1px solid var(--border);color:var(--text);outline:none;font-family:'JetBrains Mono',monospace;"
+          oninput="filterExperts(this.value)"/>
+      </div>
+
+      <!-- Catalog by family -->
+      <div id="expert-catalog"></div>
+
+      <!-- Drop zone -->
+      <div style="font-size:10px;color:var(--muted);margin:14px 0 6px;font-family:'Syne',sans-serif;font-weight:700;letter-spacing:.5px;">
+        📌 EXPERTS SÉLECTIONNÉS <span id="slot-count" style="color:var(--war);">0/1</span>
+        <span id="wr-experts-mode-hint" style="color:var(--muted);font-weight:400;margin-left:6px;">(mode Fast = 1)</span>
+      </div>
+      <div id="expert-drop-zone"
+        ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)">
+        <div id="drop-placeholder">⬆️ Glisse des experts ici • ou clique sur <strong>Ajouter</strong> dans leur fiche</div>
+      </div>
+
+      <div id="expert-selection-hint" style="font-size:10px;color:var(--muted);margin-top:6px;">
+        0 expert sélectionné — l'IA choisira les 3 meilleurs profils automatiquement.
+      </div>
+    </div>
+
+    <!-- Progress -->
+    <div id="warroom-progress">
+      <div class="progress-step" id="ps-pm">📋 Chef de Projet</div>
+      <div class="progress-step" id="ps-analyse">🔍 Orchestrateur</div>
+      <div class="progress-step" id="ps-debat">⚡ Experts</div>
+      <div class="progress-step" id="ps-synthese">🏆 Synthèse</div>
+      <div class="progress-step" id="ps-code">💻 Programmeur</div>
+    </div>
+
+    <!-- Chef de Projet plan -->
+    <div id="pm-section" style="display:none;">
+      <h3>📋 Chef de Projet — Plan Préliminaire</h3>
+      <div class="pm-objective" id="pm-objective"></div>
+      <div class="pm-steps" id="pm-steps"></div>
+      <div id="pm-risks-wrap" style="margin-top:4px;">
+        <div style="font-size:10px;color:var(--muted);margin-bottom:4px;letter-spacing:.5px;">RISQUES IDENTIFIÉS</div>
+        <div class="pm-risks" id="pm-risks"></div>
+      </div>
+    </div>
+
+    <!-- Expert cards -->
+    <div id="experts-grid">
+      <div class="expert-card" id="expert-0"><span class="expert-emoji">👤</span><div class="expert-role">Expert 1</div><div class="expert-specialty">En attente…</div><span class="expert-status waiting">En attente</span></div>
+      <div class="expert-card" id="expert-1"><span class="expert-emoji">👤</span><div class="expert-role">Expert 2</div><div class="expert-specialty">En attente…</div><span class="expert-status waiting">En attente</span></div>
+      <div class="expert-card" id="expert-2"><span class="expert-emoji">👤</span><div class="expert-role">Expert 3</div><div class="expert-specialty">En attente…</div><span class="expert-status waiting">En attente</span></div>
+      <div class="expert-card" id="expert-3" style="display:none;"><span class="expert-emoji">👤</span><div class="expert-role">Expert 4</div><div class="expert-specialty">En attente…</div><span class="expert-status waiting">En attente</span></div>
+      <div class="expert-card" id="expert-4" style="display:none;"><span class="expert-emoji">👤</span><div class="expert-role">Expert 5</div><div class="expert-specialty">En attente…</div><span class="expert-status waiting">En attente</span></div>
+    </div>
+
+    <!-- Thought trace -->
+    <div id="thought-trace">
+      <h3>📡 Flux de pensée</h3>
+      <div id="thought-lines">
+        <div class="thought-line"><span class="tl-time">--:--</span><span class="tl-text">En attente du lancement…</span></div>
+      </div>
+    </div>
+
+    <!-- Proposals -->
+    <div id="proposals-section" style="display:none;">
+      <h3>💬 Propositions des experts</h3>
+      <div class="proposal-tabs" id="proposal-tabs"></div>
+      <div id="proposal-contents"></div>
+    </div>
+
+    <!-- Synthesis -->
+    <div id="synthesis-section" style="display:none;">
+      <h3>🏆 Plan d'Action Final</h3>
+      <div id="synthesis-content"></div>
+      <div class="synthesis-actions">
+        <button class="btn btn-ghost" onclick="sendSynthesisToChat()" style="font-size:12px;">
+          💬 Envoyer dans le chat
+        </button>
+      </div>
+    </div>
+
+    <!-- Programmer Output -->
+    <div id="programmer-section" style="display:none;">
+      <h3 style="color:#4ade80;display:flex;align-items:center;gap:8px;">
+        💻 Code Généré par l'Agent Programmeur
+        <span id="wr-stack-badge" style="display:none;font-size:10px;background:rgba(6,182,212,.15);border:1px solid rgba(6,182,212,.3);color:var(--accent2);padding:2px 8px;border-radius:10px;font-family:'JetBrains Mono',monospace;"></span>
+        <span id="wr-complete-badge" style="display:none;font-size:10px;background:rgba(74,222,128,.15);border:1px solid rgba(74,222,128,.3);color:#4ade80;padding:2px 8px;border-radius:10px;font-family:'JetBrains Mono',monospace;">✅ COMPLET</span>
+        <span id="wr-incomplete-badge" style="display:none;font-size:10px;background:rgba(245,158,11,.15);border:1px solid rgba(245,158,11,.3);color:var(--warn);padding:2px 8px;border-radius:10px;font-family:'JetBrains Mono',monospace;">⚠️ TRONQUÉ</span>
+      </h3>
+
+      <!-- Files list -->
+      <div id="wr-files-section" style="display:none;margin-bottom:12px;">
+        <div style="font-size:10px;color:var(--muted);font-family:'Syne',sans-serif;font-weight:700;letter-spacing:.5px;margin-bottom:8px;">📁 FICHIERS GÉNÉRÉS</div>
+        <div id="wr-files-list" style="display:flex;flex-wrap:wrap;gap:8px;"></div>
+      </div>
+
+      <div id="programmer-content" style="background:rgba(0,0,0,.3);border:1px solid rgba(74,222,128,.2);border-radius:10px;padding:16px;overflow-x:auto;"></div>
+      <div class="synthesis-actions" style="margin-top:10px;">
+        <button class="btn btn-ghost" onclick="sendProgrammerToChat()" style="font-size:12px;border-color:rgba(74,222,128,.4);color:#4ade80;">
+          💻 Envoyer le code dans le chat
+        </button>
+        <button class="btn btn-ghost" onclick="copyProgrammerCode()" style="font-size:12px;">
+          📋 Copier le code
+        </button>
+      </div>
+    </div>
+
+    <!-- Code Review -->
+    <div id="review-section" style="display:none;">
+      <h3 style="font-family:'Syne',sans-serif;font-size:14px;font-weight:700;color:var(--accent2);margin-bottom:10px;">🔍 Revue de Code</h3>
+      <div id="review-content" style="background:rgba(6,182,212,.05);border:1px solid rgba(6,182,212,.2);border-radius:10px;padding:14px;font-size:12px;line-height:1.7;"></div>
+    </div>
+
+    <!-- Tests -->
+    <div id="tests-section" style="display:none;">
+      <h3 style="font-family:'Syne',sans-serif;font-size:14px;font-weight:700;color:var(--accent3);margin-bottom:10px;">🧪 Tests Unitaires</h3>
+      <div id="tests-content" style="background:rgba(139,92,246,.05);border:1px solid rgba(139,92,246,.2);border-radius:10px;padding:14px;overflow-x:auto;"></div>
+    </div>
+
+    <!-- Executive Summary -->
+    <div id="exec-summary-section" style="display:none;">
+      <h3 style="font-family:'Syne',sans-serif;font-size:14px;font-weight:700;color:var(--warn);margin-bottom:10px;">📊 Résumé Exécutif</h3>
+      <div id="exec-summary-content" style="background:rgba(245,158,11,.05);border:1px solid rgba(245,158,11,.2);border-radius:10px;padding:14px;font-size:12px;line-height:1.7;"></div>
+    </div>
+
+    <!-- Refine Panel -->
+    <div id="refine-section" style="display:none;background:rgba(59,130,246,.04);border:1px solid rgba(59,130,246,.2);border-radius:12px;padding:16px;">
+      <h3 style="font-family:'Syne',sans-serif;font-size:13px;font-weight:700;color:var(--accent);margin-bottom:10px;">🔧 Raffiner le Code</h3>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:8px;">Affine uniquement le programmeur sans relancer tout le pipeline (~80% moins cher en tokens).</div>
+      <div style="display:flex;gap:8px;align-items:flex-end;">
+        <textarea id="refine-input" placeholder="Ex: ajoute des logs, optimise la performance, gère les erreurs…"
+          style="flex:1;min-height:50px;max-height:100px;padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:12px;resize:none;outline:none;" rows="2"></textarea>
+        <button onclick="launchRefine()" id="wr-refine-btn"
+          style="padding:10px 16px;background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;border-radius:8px;color:#fff;font-family:'Syne',sans-serif;font-weight:700;font-size:12px;cursor:pointer;white-space:nowrap;transition:opacity .2s;">
+          🔧 Affiner
+        </button>
+      </div>
+    </div>
+
+    <!-- Feedback Panel -->
+    <div id="feedback-section" style="display:none;background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:14px;">
+      <div style="font-family:'Syne',sans-serif;font-size:11px;font-weight:700;color:var(--muted);letter-spacing:.5px;margin-bottom:10px;">⭐ NOTER LE CODE GÉNÉRÉ</div>
+      <div style="display:flex;gap:6px;margin-bottom:10px;" id="wr-stars">
+        <button class="wr-star" data-score="1" onclick="setFeedbackScore(1)" title="1/5">⭐</button>
+        <button class="wr-star" data-score="2" onclick="setFeedbackScore(2)" title="2/5">⭐</button>
+        <button class="wr-star" data-score="3" onclick="setFeedbackScore(3)" title="3/5">⭐</button>
+        <button class="wr-star" data-score="4" onclick="setFeedbackScore(4)" title="4/5">⭐</button>
+        <button class="wr-star" data-score="5" onclick="setFeedbackScore(5)" title="5/5">⭐</button>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input id="feedback-comment" type="text" placeholder="Commentaire facultatif…"
+          style="flex:1;padding:7px 10px;font-size:11px;background:var(--panel);border:1px solid var(--border);border-radius:8px;color:var(--text);outline:none;font-family:'JetBrains Mono',monospace;" />
+        <button onclick="submitFeedback()" id="wr-feedback-btn"
+          style="padding:7px 14px;background:var(--success);border:none;border-radius:8px;color:#fff;font-family:'Syne',sans-serif;font-weight:700;font-size:11px;cursor:pointer;transition:opacity .2s;">
+          Envoyer
+        </button>
+      </div>
+      <div id="feedback-avg" style="font-size:10px;color:var(--muted);margin-top:8px;display:none;"></div>
+    </div>
+
+  </div><!-- /warroom-body -->
+</div><!-- /warroom-overlay -->
+
+<!-- Expert detail modal -->
+<div id="expert-detail-modal" onclick="if(event.target===this)closeExpertDetail()">
+  <div id="expert-detail-box">
+    <span class="edb-emoji" id="edb-emoji"></span>
+    <div class="edb-role"    id="edb-role"></div>
+    <div class="edb-family"  id="edb-family"></div>
+    <div class="edb-specialty" id="edb-specialty"></div>
+    <div class="edb-actions">
+      <button class="edb-add"   id="edb-add-btn" onclick="addExpertFromDetail()">➕ Ajouter à la sélection</button>
+      <button class="edb-close" onclick="closeExpertDetail()">Fermer</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     😈 ADVOCATE MODAL
+══════════════════════════════════════════════════════════ -->
+<div id="advocate-overlay">
+  <div id="advocate-modal">
+    <div id="advocate-header">
+      <h2>😈 Avocat du Diable</h2>
+      <button class="modal-close-btn" onclick="closeAdvocate()">✕</button>
+    </div>
+    <div id="advocate-body">
+      <div id="advocate-placeholder" style="color:var(--muted);font-size:13px;text-align:center;padding:40px 0;">
+        Décris ton idée ou projet ci-dessous.<br/>
+        <small style="color:#334155;">L'IA trouvera impitoyablement toutes les failles.</small>
+      </div>
+      <div id="advocate-result" class="critique-content" style="display:none;"></div>
+    </div>
+    <div id="advocate-input-area">
+      <textarea id="advocate-input" placeholder="Ton idée, projet, plan business, code, stratégie…" rows="2"></textarea>
+      <button onclick="launchAdvocate()" id="adv-btn"
+        style="padding:10px 18px;background:linear-gradient(135deg,var(--accent3),#dc2626);border:none;border-radius:10px;color:#fff;font-family:'Syne',sans-serif;font-weight:700;font-size:13px;cursor:pointer;transition:opacity .2s;white-space:nowrap;align-self:flex-end;">
+        😈 Critiquer
+      </button>
+    </div>
+  </div>
+</div>
+
+
+
+
+
+<!-- ══════════════════════════════════════════════════════════
+     🐍 IDE PYTHON OVERLAY
+══════════════════════════════════════════════════════════ -->
+<div id="ide-overlay">
+  <div id="ide-header">
+    <h2>🐍 IDE Python — Éditeur IA</h2>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <span id="ide-status" style="font-size:11px;color:var(--muted);font-family:'JetBrains Mono',monospace;"></span>
+      <button id="ide-close" onclick="closeIDE()">✕ Fermer</button>
+    </div>
+  </div>
+  <div id="ide-body">
+
+    <!-- LEFT : Éditeur + output -->
+    <div id="ide-left">
+      <div id="ide-toolbar">
+        <input type="text" class="ide-filename" id="ide-filename" value="script.py" placeholder="nom_fichier.py"/>
+        <button id="ide-run-btn" onclick="ideRun()">
+          <span id="ide-run-icon">▶</span> Exécuter
+        </button>
+        <button id="ide-clear-btn" onclick="ideEditor.value = ''; ideEditor.focus();">🗑 Vider</button>
+        <button id="ide-send-chat-btn" onclick="ideSendToChat()">💬 Envoyer dans le chat</button>
+      </div>
+      <div id="ide-editor-wrap">
+        <textarea id="ide-editor" spellcheck="false" autocorrect="off" autocapitalize="off"
+          placeholder="# Écris ton code Python ici…&#10;print('Hello, NeuralChat!')"></textarea>
+      </div>
+      <div id="ide-output-panel">
+        <div id="ide-output-tabs">
+          <button class="ide-otab active" id="ide-tab-out" onclick="ideShowTab('out')">▶ Sortie</button>
+          <button class="ide-otab" id="ide-tab-err" onclick="ideShowTab('err')">⚠ Erreurs</button>
+          <button class="ide-otab" id="ide-tab-pkg" onclick="ideShowTab('pkg')" style="color:#a78bfa;">📦 Packages</button>
+          <span style="margin-left:auto;padding:7px 14px;font-size:10px;color:var(--muted);font-family:'JetBrains Mono',monospace;" id="ide-duration"></span>
+        </div>
+        <div id="ide-output-content">
+          <span class="out-empty">Clique sur ▶ Exécuter pour voir la sortie ici.</span>
+        </div>
+        <!-- Package manager panel (hidden by default) -->
+        <div id="ide-pkg-panel" style="display:none;flex:1;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:10px;">
+          <div style="display:flex;gap:8px;align-items:center;flex-shrink:0;">
+            <input id="ide-pkg-input" type="text" placeholder="Ex: numpy, requests==2.31.0, pandas>=2.0"
+              style="flex:1;padding:8px 12px;background:#0d1117;border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:12px;outline:none;transition:border-color .2s;"
+              onfocus="this.style.borderColor='#a78bfa'" onblur="this.style.borderColor='var(--border)'"
+              onkeydown="if(event.key==='Enter')ideInstall()"/>
+            <button id="ide-install-btn" onclick="ideInstall()"
+              style="padding:8px 16px;background:linear-gradient(135deg,#7c3aed,#6d28d9);border:none;border-radius:8px;color:#fff;font-family:'Syne',sans-serif;font-weight:700;font-size:12px;cursor:pointer;white-space:nowrap;transition:opacity .2s;display:flex;align-items:center;gap:6px;">
+              <span id="ide-install-icon">📦</span> Installer
+            </button>
+          </div>
+          <div style="font-size:10px;color:var(--muted);flex-shrink:0;">
+            Sépare plusieurs packages par des virgules • Supports les versions : <code style="color:#a78bfa;background:rgba(139,92,246,.1);padding:1px 5px;border-radius:3px;">numpy==1.24</code>
+          </div>
+          <div id="ide-install-output"
+            style="flex:1;min-height:80px;overflow-y:auto;background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:10px;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.7;color:#c9d1d9;">
+            <span style="color:#334155;font-style:italic;">La sortie d'installation apparaîtra ici…</span>
+          </div>
+          <div id="ide-installed-list" style="display:flex;flex-wrap:wrap;gap:6px;flex-shrink:0;"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT : Aide IA -->
+    <div id="ide-right">
+      <div id="ide-ai-header">
+        🤖 Aide IA Python
+        <button onclick="clearIdeAI()" style="background:none;border:1px solid var(--border);border-radius:6px;color:var(--muted);font-size:10px;padding:3px 8px;cursor:pointer;font-family:'Syne',sans-serif;font-weight:600;transition:all .2s;" onmouseover="this.style.color='var(--danger)'" onmouseout="this.style.color='var(--muted)'">Vider</button>
+      </div>
+      <div id="ide-ai-messages">
+        <div class="ide-ai-msg bot">
+          👋 Bonjour ! Je suis ton assistant Python.<br/><br/>
+          Je peux <strong>écrire du code</strong>, <strong>expliquer des erreurs</strong>, <strong>optimiser</strong> ou <strong>ajouter des fonctionnalités</strong>.<br/><br/>
+          Utilise les boutons rapides ou pose-moi une question.
+        </div>
+      </div>
+      <div id="ide-ai-input-area">
+        <div id="ide-ai-quick-btns">
+          <button class="ide-quick-btn" onclick="ideAIQuick('Quels packages pip dois-je installer pour ce code ?')">📦 Packages ?</button>
+          <button class="ide-quick-btn" onclick="ideAIQuick('Explique ce code')">🔍 Expliquer</button>
+          <button class="ide-quick-btn" onclick="ideAIQuick('Corrige les erreurs')">🔧 Corriger</button>
+          <button class="ide-quick-btn" onclick="ideAIQuick('Optimise les performances')">⚡ Optimiser</button>
+          <button class="ide-quick-btn" onclick="ideAIQuick('Ajoute des commentaires détaillés')">💬 Commenter</button>
+          <button class="ide-quick-btn" onclick="ideAIQuick('Génère des tests unitaires')">🧪 Tests</button>
+          <button class="ide-quick-btn" onclick="ideAIQuick('Explique l\'erreur dans la sortie')">❌ Erreur ?</button>
+        </div>
+        <div id="ide-ai-input-row">
+          <textarea id="ide-ai-input" placeholder="Pose une question sur ton code…" rows="1"
+            onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();ideAISend();}"></textarea>
+          <button id="ide-ai-send-btn" onclick="ideAISend()">Envoyer</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     SIDEBAR
+══════════════════════════════════════════════════════════ -->
+<aside id="sidebar">
+  <div><h1>NeuralChat<span>Powered by OpenRouter</span></h1></div>
+
+  <div>
+    <div class="section-label">Modèle IA</div>
+    <select id="model-select">
+      {% for m in models %}
+      <option value="{{ m.id }}" {% if m.id == default_model %}selected{% endif %}>{{ m.label }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <div>
+    <div class="section-label">Contexte / Persona <span style="color:var(--success);font-size:10px;">(auto)</span></div>
+    <div class="field-group">
+      <label class="field-label">Comportement de l'IA</label>
+      <textarea id="system-prompt" placeholder="Ex: Tu es un expert Python. Réponds avec des exemples concrets…" oninput="debouncedSaveContext()"></textarea>
+      <small style="color:var(--muted);font-size:11px;margin-top:4px;">Sauvegardé automatiquement</small>
+    </div>
+  </div>
+
+  <div>
+    <div class="section-label">Skills & Expertise</div>
+    <div class="field-group">
+      <div class="skills-list" id="skills-list"></div>
+      <button class="btn btn-secondary btn-full" onclick="openSkillModal()">➕ Ajouter un skill</button>
+    </div>
+  </div>
+
+  <div>
+    <div class="section-label">⚡ Outils Avancés</div>
+    <div style="display:flex;flex-direction:column;gap:8px;">
+      <button class="btn btn-war btn-full" onclick="openWarRoom()">⚔️ War Room</button>
+      <button class="btn btn-advocate btn-full" onclick="openAdvocate()">😈 Avocat du Diable</button>
+      <button class="btn btn-full" onclick="openIDE()" style="background:linear-gradient(135deg,#16a34a,#15803d);color:#fff;">🐍 IDE Python</button>
+    </div>
+  </div>
+
+  <div>
+    <div class="section-label">🌐 Langue de réponse</div>
+    <select id="lang-select" onchange="setLang(this.value)">
+      <option value="fr">🇫🇷 Français</option>
+      <option value="en">🇬🇧 English</option>
+      <option value="es">🇪🇸 Español</option>
+      <option value="de">🇩🇪 Deutsch</option>
+      <option value="pt">🇧🇷 Português</option>
+      <option value="ar">🇸🇦 العربية</option>
+      <option value="zh">🇨🇳 中文</option>
+      <option value="ja">🇯🇵 日本語</option>
+    </select>
+  </div>
+
+  <div>
+    <div class="section-label">Session</div>
+    <div id="stats">
+      Messages : <span id="stat-msgs">0</span><br/>
+      Tokens estimés : <span id="stat-tokens">0</span><br/>
+      Contexte actif : <span id="stat-ctx">Non</span><br/>
+      Skills actifs : <span id="stat-skills">0</span>
+    </div>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:8px;margin-top:auto;">
+    <button class="btn btn-ghost btn-full" onclick="exportChat()">⬇ Exporter la conv.</button>
+    <button class="btn btn-danger btn-full" onclick="clearChat()">✕ Effacer la mémoire</button>
+  </div>
+</aside>
+
+<!-- ══════════════════════════════════════════════════════════
+     MAIN AREA
+══════════════════════════════════════════════════════════ -->
+<div id="app-wrapper">
+  <div id="topbar">
+    <button id="sidebar-toggle" onclick="document.getElementById('sidebar').classList.toggle('open')">☰</button>
+    <span style="font-family:'Syne',sans-serif;font-weight:700;font-size:15px;color:var(--text);">💬 Chat</span>
+    <div id="topbar-right">
+      <span id="skills-indicator">✨ Skills actifs</span>
+      <span id="context-indicator">Contexte actif</span>
+      <span id="model-badge">{{ default_model }}</span>
+      <div id="auth-zone"></div>
+    </div>
+  </div>
+
+  <div id="messages">
+    <div id="welcome">
+      <h2>Bonjour 👋</h2>
+      <p>Assistant IA avec mémoire de conversation et outils avancés. Configure un contexte dans le panneau gauche pour personnaliser mon comportement.</p>
+      <div class="features">
+        <span class="feature-pill war">⚔️ War Room Multi-Agents</span>
+        <span class="feature-pill devil">😈 Avocat du Diable</span>
+        <span class="feature-pill" style="border-color:rgba(22,163,74,.4);color:#4ade80;background:rgba(22,163,74,.05);">🐍 IDE Python</span>
+        <span class="feature-pill" style="border-color:rgba(6,182,212,.4);color:var(--accent2);background:rgba(6,182,212,.05);">🌐 Choix de langue</span>
+      </div>
+      <div class="hint">Entrée pour envoyer · Shift+Entrée pour un saut de ligne</div>
+    </div>
+    <div id="typing">
+      <div class="avatar bot">🤖</div>
+      <div class="typing-dots"><span></span><span></span><span></span></div>
+    </div>
+  </div>
+
+  <div id="input-area">
+    <div id="file-attach-area"></div>
+    <button id="attach-btn" class="action-btn" title="Attacher un fichier"
+            onclick="document.getElementById('file-input').click()">
+      <svg viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+    </button>
+    <input type="file" id="file-input" multiple style="display:none" onchange="handleFileSelect(event)"/>
+    <textarea id="message-input" placeholder="Envoie un message…" rows="1"></textarea>
+    <button id="send-btn" class="action-btn" onclick="sendMessage()" title="Envoyer">
+      <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+    </button>
+  </div>
+
+  <!-- Special tools bar -->
+  <div class="special-tools" style="padding-bottom:12px;">
+    <button class="tool-btn war"   onclick="openWarRoom()">⚔️ War Room</button>
+    <button class="tool-btn devil" onclick="openAdvocate()">😈 Avocat du Diable</button>
+    <button class="tool-btn" onclick="openIDE()" style="border-color:rgba(22,163,74,.5);color:#4ade80;">🐍 IDE Python</button>
+    <button class="tool-btn" onclick="prefillCurrentMessage()" style="border-color:rgba(100,116,139,.4);" title="Utiliser le message actuel comme base">📋 Utiliser message</button>
+  </div>
+</div>
+
+<div id="toast"></div>
+
 <script>
-function switchTab(tab){
-  document.getElementById('form-login').style.display=tab==='login'?'block':'none';
-  document.getElementById('form-register').style.display=tab==='register'?'block':'none';
-  document.getElementById('tab-login').classList.toggle('active',tab==='login');
-  document.getElementById('tab-register').classList.toggle('active',tab==='register');
-  clearMessages();
+/* ===================================================
+   GLOBALS
+   =================================================== */
+let hasContext    = false;
+let skills        = [];
+let attachedFiles = [];
+let contextSaveTimeout;
+let currentUser   = null;
+let warRoomData   = null;  // stocke la dernière synthèse War Room
+let currentLang   = 'fr';
+let mermaidCounter = 0;
+
+/* ===================================================
+   AUTH ZONE
+   =================================================== */
+function renderAuthZone() {
+  const zone = document.getElementById('auth-zone');
+  if (currentUser) {
+    const initial = currentUser.username.charAt(0).toUpperCase();
+    zone.innerHTML = `
+      <div class="user-menu-wrapper" id="user-menu-wrapper">
+        <button class="user-avatar-btn" onclick="toggleUserMenu(event)">
+          <div class="avatar-circle">${escHtml(initial)}</div>
+          <span>${escHtml(currentUser.username)}</span>
+          <span style="font-size:10px;color:var(--muted);margin-left:2px">▾</span>
+        </button>
+        <div class="user-dropdown" id="user-dropdown">
+          <div class="user-dropdown-header">
+            <div class="uname">${escHtml(currentUser.username)}</div>
+            <div class="uemail">${escHtml(currentUser.email || 'Pas d\'email renseigné')}</div>
+          </div>
+          <button class="dropdown-item" onclick="exportChat()">⬇ Exporter la conversation</button>
+          <button class="dropdown-item danger" onclick="doLogout()">↩ Se déconnecter</button>
+        </div>
+      </div>`;
+  } else {
+    zone.innerHTML = `
+      <button class="login-btn-topbar" onclick="window.location='/login'">
+        👤 Se connecter
+      </button>`;
+  }
 }
-function clearMessages(){
-  ['login-error','login-success','register-error','register-success'].forEach(id=>{
-    const el=document.getElementById(id);el.className=el.className.replace(' visible','');
+
+function toggleUserMenu(e) {
+  e.stopPropagation();
+  document.getElementById('user-dropdown').classList.toggle('open');
+}
+
+document.addEventListener('click', () => {
+  const dd = document.getElementById('user-dropdown');
+  if (dd) dd.classList.remove('open');
+});
+
+async function doLogout() {
+  await fetch('/api/auth/logout', { method: 'POST' });
+  currentUser = null;
+  renderAuthZone();
+  showToast('Déconnecté', 'success');
+}
+
+async function loadUser() {
+  try {
+    const res  = await fetch('/api/auth/me');
+    const data = await res.json();
+    currentUser = data.logged_in
+      ? { username: data.username, email: data.email, created_at: data.created_at }
+      : null;
+  } catch {
+    currentUser = null;
+  }
+  renderAuthZone();
+}
+
+/* ===================================================
+   TEXTAREA + ENTER
+   =================================================== */
+const msgInput = document.getElementById('message-input');
+msgInput.addEventListener('input', () => {
+  msgInput.style.height = 'auto';
+  msgInput.style.height = Math.min(msgInput.scrollHeight, 160) + 'px';
+});
+msgInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+
+/* ===================================================
+   CONTEXT AUTO-SAVE
+   =================================================== */
+function saveContext() {
+  const prompt = document.getElementById('system-prompt').value.trim();
+  const model  = document.getElementById('model-select').value;
+  fetch('/api/context', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ system_prompt: prompt, model })
+  }).then(() => {
+    hasContext = !!prompt;
+    document.getElementById('context-indicator').style.display = hasContext ? 'flex' : 'none';
+    document.getElementById('stat-ctx').textContent = hasContext ? 'Oui' : 'Non';
+    document.getElementById('model-badge').textContent = model;
+  }).catch(console.error);
+}
+function debouncedSaveContext() {
+  clearTimeout(contextSaveTimeout);
+  contextSaveTimeout = setTimeout(saveContext, 1000);
+}
+document.getElementById('model-select').addEventListener('change', saveContext);
+
+/* ===================================================
+   LANGUAGE
+   =================================================== */
+function setLang(lang) {
+  currentLang = lang;
+  // Persist silently via chat route on next message, also call context endpoint
+  fetch('/api/context', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ lang })
+  }).catch(console.error);
+  showToast('Langue : ' + document.getElementById('lang-select').options[document.getElementById('lang-select').selectedIndex].text, 'success');
+}
+
+/* ===================================================
+   SKILLS
+   =================================================== */
+function openSkillModal() {
+  document.getElementById('skill-modal').classList.add('active');
+  document.getElementById('skill-input').value = '';
+  setTimeout(() => document.getElementById('skill-input').focus(), 100);
+}
+function closeSkillModal() { document.getElementById('skill-modal').classList.remove('active'); }
+async function addSkill() {
+  const name = document.getElementById('skill-input').value.trim();
+  if (!name) return showToast('Veuillez entrer un nom de skill', 'error');
+  if (skills.includes(name)) return showToast('Ce skill existe déjà', 'error');
+  skills.push(name); renderSkills(); closeSkillModal();
+  await syncSkills(); showToast('Skill "' + name + '" ajouté', 'success');
+}
+async function removeSkill(name) {
+  skills = skills.filter(s => s !== name); renderSkills();
+  await syncSkills(); showToast('Skill supprimé', 'success');
+}
+async function syncSkills() {
+  await fetch('/api/skills', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ skills }) });
+}
+function renderSkills() {
+  const container = document.getElementById('skills-list');
+  container.innerHTML = skills.map(s => `
+    <div class="skill-tag">
+      <span class="skill-name">✨ ${escHtml(s)}</span>
+      <button class="skill-remove" onclick="removeSkill('${escHtml(s)}')" title="Supprimer">✕</button>
+    </div>`).join('');
+  const has = skills.length > 0;
+  document.getElementById('skills-indicator').style.display = has ? 'flex' : 'none';
+  document.getElementById('stat-skills').textContent = skills.length;
+}
+
+/* ===================================================
+   FILE HANDLING
+   =================================================== */
+function handleFileSelect(event) {
+  Array.from(event.target.files).forEach(f => {
+    if (f.size > 5 * 1024 * 1024) return showToast(f.name + ' dépasse 5MB', 'error');
+    if (attachedFiles.find(x => x.name === f.name)) return showToast(f.name + ' déjà ajouté', 'error');
+    attachedFiles.push(f);
+  });
+  renderAttachedFiles(); event.target.value = '';
+}
+function renderAttachedFiles() {
+  const c = document.getElementById('file-attach-area');
+  c.innerHTML = attachedFiles.map(f => `
+    <div class="file-chip">
+      📄 ${escHtml(f.name)} <small>(${(f.size/1024).toFixed(1)}KB)</small>
+      <button class="remove" onclick="removeAttached('${escHtml(f.name)}')">✕</button>
+    </div>`).join('');
+  c.className = attachedFiles.length ? 'visible' : '';
+}
+function removeAttached(name) {
+  attachedFiles = attachedFiles.filter(f => f.name !== name);
+  renderAttachedFiles();
+}
+
+/* ===================================================
+   SEND MESSAGE
+   =================================================== */
+async function sendMessage() {
+    const text = msgInput.value.trim();
+    if (!text && attachedFiles.length === 0) return;
+    msgInput.value = ''; msgInput.style.height = 'auto';
+    document.getElementById('welcome')?.remove();
+
+    let display = text || '[Fichier joint]';
+    if (attachedFiles.length) display += '\n📎 ' + attachedFiles.map(f => f.name).join(', ');
+    appendMessage('user', display);
+    setTyping(true);
+
+    try {
+        const fd = new FormData();
+        fd.append('message', text);
+        fd.append('lang', currentLang);
+        attachedFiles.forEach(f => fd.append('files', f));
+        attachedFiles = []; renderAttachedFiles();
+
+        const res = await fetch('/api/chat', { method: 'POST', body: fd });
+        const data = await res.json();
+        setTyping(false);
+
+        if (data.error) return showToast(data.error, 'error');
+
+        if (data.ignored_files && data.ignored_files.length) {
+            data.ignored_files.forEach(fileReason => {
+                showToast(`Fichier ignoré: ${fileReason}`, 'warn');
+            });
+        }
+
+        appendMessage('bot', data.reply);
+        updateStats(data.total_messages, data.estimated_tokens);
+    } catch {
+        setTyping(false);
+        showToast('Erreur réseau', 'error');
+    }
+}
+
+/* ===================================================
+   RENDER MESSAGE
+   =================================================== */
+function appendMessage(role, text) {
+  const container = document.getElementById('messages');
+  const typing    = document.getElementById('typing');
+  const wrapper   = document.createElement('div');
+  wrapper.className = `msg-wrapper ${role}`;
+
+  const avatar = document.createElement('div');
+  avatar.className = `avatar ${role}`;
+  avatar.textContent = role === 'user'
+    ? (currentUser ? currentUser.username.charAt(0).toUpperCase() : '🧑')
+    : '🤖';
+
+  const inner  = document.createElement('div');
+  const bubble = document.createElement('div');
+  bubble.className = `bubble ${role}`;
+
+  if (role === 'bot') {
+    // Traiter les blocs Mermaid séparément du reste du markdown
+    bubble.innerHTML = renderWithMermaid(text);
+    bubble.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+    // Rendre les diagrammes Mermaid
+    renderMermaidInElement(bubble);
+  } else {
+    bubble.innerHTML = escHtml(text);
+  }
+
+  const time = document.createElement('div');
+  time.className   = 'msg-time';
+  time.textContent = new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+  if (role === 'user') time.style.textAlign = 'right';
+
+  inner.append(bubble, time);
+  if (role === 'user') wrapper.append(inner, avatar);
+  else                 wrapper.append(avatar, inner);
+
+  container.insertBefore(wrapper, typing);
+  container.scrollTop = container.scrollHeight;
+}
+
+function renderWithMermaid(text) {
+  // Remplacer les blocs ```mermaid par des div mermaid
+  return marked.parse(text.replace(/```mermaid\n?([\s\S]*?)```/g, (match, code) => {
+    const id = `mermaid-${++mermaidCounter}`;
+    return `<div class="mermaid-wrapper"><div class="mermaid" id="${id}">${escHtml(code.trim())}</div></div>`;
+  }));
+}
+
+async function renderMermaidInElement(el) {
+  if (typeof mermaid === 'undefined') return;  // mermaid non chargé
+  const nodes = el.querySelectorAll('.mermaid');
+  for (const node of nodes) {
+    try {
+      const code = node.textContent;
+      const { svg } = await mermaid.render(`mermaid-render-${Date.now()}`, code);
+      node.innerHTML = svg;
+    } catch (e) {
+      node.innerHTML = `<pre style="color:var(--danger);font-size:11px;">Erreur diagramme: ${e.message}</pre>`;
+    }
+  }
+}
+
+function setTyping(on) {
+  document.getElementById('typing').className = on ? 'visible' : '';
+  document.getElementById('send-btn').disabled = on;
+  if (on) document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
+}
+function updateStats(msgs, tokens) {
+  document.getElementById('stat-msgs').textContent   = msgs   ?? '–';
+  document.getElementById('stat-tokens').textContent = tokens ?? '–';
+}
+
+/* ===================================================
+   CLEAR & EXPORT
+   =================================================== */
+async function clearChat() {
+  if (!confirm('Effacer toute la mémoire de conversation ?')) return;
+  await fetch('/api/clear', { method: 'POST' });
+  document.getElementById('messages').innerHTML = `
+    <div id="welcome">
+      <h2>Conversation effacée ✓</h2><p>La mémoire a été réinitialisée.</p>
+    </div>
+    <div id="typing">
+      <div class="avatar bot">🤖</div>
+      <div class="typing-dots"><span></span><span></span><span></span></div>
+    </div>`;
+  updateStats(0, 0);
+  showToast('Mémoire effacée', 'success');
+}
+
+async function exportChat() {
+  const res  = await fetch('/api/history');
+  const data = await res.json();
+  if (!data.messages?.length) return showToast('Aucun message à exporter', 'error');
+
+  let md = '# Conversation — ' + new Date().toLocaleString('fr-FR') + '\n\n';
+  if (currentUser) md += '> **Utilisateur :** ' + currentUser.username + '\n\n';
+  if (data.system_prompt) md += '> **Contexte :** ' + data.system_prompt + '\n\n';
+  if (data.skills?.length) md += '> **Skills :** ' + data.skills.join(', ') + '\n\n---\n\n';
+  data.messages.forEach(m => {
+    md += (m.role === 'user' ? '**Vous**' : '**IA**') + '\n\n' + m.content + '\n\n---\n\n';
+  });
+  const a = Object.assign(document.createElement('a'), {
+    href: URL.createObjectURL(new Blob([md], { type: 'text/markdown' })),
+    download: 'conversation_' + Date.now() + '.md'
+  });
+  a.click();
+  showToast('Exporté', 'success');
+}
+
+/* ===================================================
+   ⚔️ WAR ROOM — Mode + Globals
+   =================================================== */
+let warRoomMode    = 'fast';
+let warRoomSynth   = '';   // garde la synthèse pour le raffinage
+let feedbackScore  = 0;
+
+const WR_MODE_DESCS = {
+  fast:     '⚡ Fast — 1 expert, sans reviewer ni tests. Idéal pour les questions rapides.',
+  balanced: '⚖️ Balanced — 3 experts, reviewer de code, résumé exécutif. Recommandé.',
+  full:     '🔥 Full — 5 experts, débat, avocat du diable, tests unitaires, résumé. Maximum de qualité.',
+};
+const WR_MODE_SLOTS = { fast: 1, balanced: 3, full: 5 };
+
+function setWarRoomMode(mode) {
+  warRoomMode = mode;
+  document.querySelectorAll('.wr-mode-btn').forEach(b => {
+    const isActive = b.dataset.mode === mode;
+    b.classList.toggle('active', isActive);
+    b.style.background = isActive ? 'rgba(249,115,22,.2)' : 'transparent';
+    b.style.color = isActive ? 'var(--war)' : 'var(--muted)';
+  });
+  document.getElementById('wr-mode-desc').textContent = WR_MODE_DESCS[mode] || '';
+  const maxSlots = WR_MODE_SLOTS[mode] || 3;
+  // Retirer les experts en trop si mode fast
+  while (selectedExperts.length > maxSlots) selectedExperts.pop();
+  renderDropZone();
+  const hint = document.getElementById('wr-experts-mode-hint');
+  if (hint) {
+    const labels = { fast: 'mode Fast = 1', balanced: 'mode Balanced = 3', full: 'mode Full = 5' };
+    hint.textContent = '(' + (labels[mode] || '') + ')';
+  }
+}
+
+function openWarRoom() {
+  document.getElementById('warroom-overlay').classList.add('active');
+  const msg = document.getElementById('message-input').value.trim();
+  if (msg) document.getElementById('warroom-input').value = msg;
+  if (!Object.keys(expertCatalog).length) loadExpertCatalog();
+}
+function closeWarRoom() {
+  document.getElementById('warroom-overlay').classList.remove('active');
+}
+
+function addThought(text, highlight = false) {
+  const lines = document.getElementById('thought-lines');
+  const d = new Date();
+  const t = d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0') + ':' + d.getSeconds().toString().padStart(2,'0');
+  const line = document.createElement('div');
+  line.className = 'thought-line' + (highlight ? ' highlight' : '');
+  line.innerHTML = `<span class="tl-time">${t}</span><span class="tl-text">${escHtml(text)}</span>`;
+  lines.appendChild(line);
+  lines.scrollTop = lines.scrollHeight;
+}
+
+function setProgressStep(step) {
+  const steps = ['pm', 'analyse', 'debat', 'synthese', 'code'];
+  const idx = steps.indexOf(step);
+  steps.forEach((s, i) => {
+    const el = document.getElementById('ps-' + s);
+    if (!el) return;
+    if (i < idx) el.className = 'progress-step done';
+    else if (i === idx) el.className = 'progress-step active';
+    else el.className = 'progress-step';
   });
 }
-function showMsg(id,msg){const el=document.getElementById(id);el.textContent=msg;el.classList.add('visible');}
-async function doLogin(){
-  const btn=document.getElementById('login-btn');
-  const username=document.getElementById('login-username').value.trim();
-  const password=document.getElementById('login-password').value.trim();
-  clearMessages();
-  if(!username||!password)return showMsg('login-error','Veuillez remplir tous les champs');
-  btn.disabled=true;btn.textContent='Connexion…';
-  try{
-    const res=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password})});
-    const data=await res.json();
-    if(data.ok){showMsg('login-success','Bienvenue, '+data.username+' !');setTimeout(()=>window.location='/',800);}
-    else{showMsg('login-error',data.error||'Erreur inconnue');btn.disabled=false;btn.textContent='Se connecter →';}
-  }catch{showMsg('login-error','Erreur réseau');btn.disabled=false;btn.textContent='Se connecter →';}
+
+function setExpertState(idx, state, expert) {
+  const card = document.getElementById('expert-' + idx);
+  if (!card) return;
+  card.className = 'expert-card ' + state;
+  if (expert) {
+    card.querySelector('.expert-emoji').textContent = expert.emoji || '🤖';
+    card.querySelector('.expert-role').textContent  = expert.role;
+    card.querySelector('.expert-specialty').textContent = expert.specialty;
+  }
+  const status = card.querySelector('.expert-status');
+  status.className = 'expert-status ' + state;
+  status.textContent = state === 'thinking' ? '⚡ En réflexion…' :
+                       state === 'done'     ? '✓ Terminé'        : '⏳ En attente';
 }
-async function doRegister(){
-  const btn=document.getElementById('register-btn');
-  const username=document.getElementById('reg-username').value.trim();
-  const email=document.getElementById('reg-email').value.trim();
-  const password=document.getElementById('reg-password').value.trim();
-  const confirm=document.getElementById('reg-confirm').value.trim();
-  clearMessages();
-  if(!username||!password||!confirm)return showMsg('register-error','Veuillez remplir les champs obligatoires');
-  if(password!==confirm)return showMsg('register-error','Les mots de passe ne correspondent pas');
-  if(password.length<6)return showMsg('register-error','Le mot de passe doit faire au moins 6 caractères');
-  btn.disabled=true;btn.textContent='Création…';
-  try{
-    const res=await fetch('/api/auth/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password,email})});
-    const data=await res.json();
-    if(data.ok){showMsg('register-success','Compte créé ! Redirection…');setTimeout(()=>window.location='/',900);}
-    else{showMsg('register-error',data.error||'Erreur inconnue');btn.disabled=false;btn.textContent='Créer mon compte →';}
-  }catch{showMsg('register-error','Erreur réseau');btn.disabled=false;btn.textContent='Créer mon compte →';}
+
+function _wrResetUI() {
+  document.getElementById('thought-lines').innerHTML = '';
+  ['proposals-section','synthesis-section','programmer-section','pm-section',
+   'review-section','tests-section','exec-summary-section','refine-section',
+   'feedback-section','wr-files-section'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = 'none';
+  });
+  ['wr-stack-badge','wr-complete-badge','wr-incomplete-badge'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = 'none';
+  });
+  [0,1,2,3,4].forEach(i => {
+    const card = document.getElementById('expert-' + i);
+    if (card) setExpertState(i, 'waiting', null);
+  });
+  setProgressStep('pm');
+  warRoomData = null;
+  warRoomSynth = '';
 }
-document.addEventListener('keydown',e=>{
-  if(e.key!=='Enter')return;
-  if(document.getElementById('form-login').style.display!=='none')doLogin();
-  else doRegister();
+
+function _wrShowPM(pm) {
+  if (!pm?.objective) return;
+  document.getElementById('pm-objective').textContent = '🎯 ' + pm.objective;
+  const stepsEl = document.getElementById('pm-steps');
+  stepsEl.innerHTML = (pm.action_plan || []).map(s => `
+    <div class="pm-step">
+      <span class="step-num">${s.step}</span>
+      <span style="flex:1">${escHtml(s.action)}</span>
+      <span class="step-prio ${escHtml(s.priority || 'moyenne')}">${escHtml(s.priority || 'moyenne')}</span>
+    </div>`).join('');
+  const risksEl = document.getElementById('pm-risks');
+  risksEl.innerHTML = (pm.key_risks || []).map(r => `<span class="pm-risk-tag">⚠️ ${escHtml(r)}</span>`).join('');
+  document.getElementById('pm-section').style.display = 'block';
+  addThought('✅ Plan préliminaire — ' + (pm.action_plan || []).length + ' étapes');
+}
+
+function _wrShowExperts(experts, strategy, proposals) {
+  setProgressStep('debat');
+  addThought('✅ Stratégie : ' + (strategy || ''));
+  // Resize expert grid dynamically
+  const grid = document.getElementById('experts-grid');
+  const n = experts.length;
+  grid.style.gridTemplateColumns = n <= 3 ? 'repeat(3,1fr)' : 'repeat(auto-fill,minmax(160px,1fr))';
+  // Show/hide cards
+  [0,1,2,3,4].forEach(i => {
+    const card = document.getElementById('expert-' + i);
+    if (!card) return;
+    card.style.display = i < n ? 'block' : 'none';
+  });
+  experts.forEach((exp, i) => {
+    addThought(`${exp.emoji} ${exp.role}`);
+    setExpertState(i, 'done', exp);
+  });
+  // Proposals tabs
+  const tabsEl     = document.getElementById('proposal-tabs');
+  const contentsEl = document.getElementById('proposal-contents');
+  tabsEl.innerHTML = contentsEl.innerHTML = '';
+  (proposals || []).forEach((p, i) => {
+    const tab = document.createElement('button');
+    tab.className   = 'ptab' + (i === 0 ? ' active' : '');
+    tab.textContent = `${p.expert.emoji} ${p.expert.role}`;
+    tab.onclick = () => {
+      document.querySelectorAll('.ptab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.proposal-content').forEach(c => c.classList.remove('active'));
+      tab.classList.add('active');
+      document.getElementById('pc-' + i).classList.add('active');
+    };
+    tabsEl.appendChild(tab);
+    const content = document.createElement('div');
+    content.className = 'proposal-content' + (i === 0 ? ' active' : '');
+    content.id = 'pc-' + i;
+    content.innerHTML = marked.parse(p.text || '');
+    content.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+    contentsEl.appendChild(content);
+  });
+  document.getElementById('proposals-section').style.display = 'block';
+}
+
+function _wrShowSynthesis(synthesis) {
+  warRoomSynth = synthesis;
+  setProgressStep('synthese');
+  const synthEl = document.getElementById('synthesis-content');
+  synthEl.innerHTML = marked.parse(synthesis);
+  synthEl.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+  document.getElementById('synthesis-section').style.display = 'block';
+  addThought('🏆 Synthèse disponible', true);
+}
+
+function _wrShowCode(programmerOutput, files, complete, stack) {
+  setProgressStep('code');
+  addThought('💻 Code généré !', true);
+  const progEl = document.getElementById('programmer-content');
+  progEl.innerHTML = marked.parse(programmerOutput);
+  progEl.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+  document.getElementById('programmer-section').style.display = 'block';
+  // Stack badge
+  if (stack) {
+    const sb = document.getElementById('wr-stack-badge');
+    sb.textContent = '🔧 ' + stack;
+    sb.style.display = 'inline';
+  }
+  // Complete / truncated badge
+  document.getElementById(complete ? 'wr-complete-badge' : 'wr-incomplete-badge').style.display = 'inline';
+  // Files
+  if (files && files.length) {
+    const listEl = document.getElementById('wr-files-list');
+    listEl.innerHTML = files.map(f => `
+      <div class="wr-file-chip ${f.syntax_valid ? 'valid' : 'invalid'}" title="${escHtml(f.syntax_errors?.join(', ') || 'OK')}">
+        <span>📄 ${escHtml(f.filename)}</span>
+        <span class="fc-lang">${escHtml(f.language)}</span>
+        <span class="fc-lines">${f.line_count}L</span>
+        ${!f.syntax_valid ? '<span style="color:var(--danger);font-size:10px;">⚠️ syntax</span>' : '<span style="color:var(--success);font-size:10px;">✓</span>'}
+      </div>`).join('');
+    document.getElementById('wr-files-section').style.display = 'block';
+  }
+  // Show refine & feedback sections
+  document.getElementById('refine-section').style.display = 'block';
+  document.getElementById('feedback-section').style.display = 'block';
+}
+
+function _wrShowReview(reviewComments, programmerOutput, files) {
+  if (!reviewComments) return;
+  addThought('🔍 Revue de code terminée');
+  const revEl = document.getElementById('review-content');
+  revEl.innerHTML = marked.parse(reviewComments);
+  revEl.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+  document.getElementById('review-section').style.display = 'block';
+  // Update code if reviewer corrected it
+  if (programmerOutput) {
+    const progEl = document.getElementById('programmer-content');
+    progEl.innerHTML = marked.parse(programmerOutput);
+    progEl.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+    if (files?.length) {
+      const listEl = document.getElementById('wr-files-list');
+      listEl.innerHTML = files.map(f => `
+        <div class="wr-file-chip ${f.syntax_valid ? 'valid' : 'invalid'}">
+          <span>📄 ${escHtml(f.filename)}</span>
+          <span class="fc-lang">${escHtml(f.language)}</span>
+          <span class="fc-lines">${f.line_count}L</span>
+          ${!f.syntax_valid ? '<span style="color:var(--danger);font-size:10px;">⚠️</span>' : '<span style="color:var(--success);font-size:10px;">✓</span>'}
+        </div>`).join('');
+    }
+  }
+}
+
+function _wrShowTests(testsOutput) {
+  if (!testsOutput) return;
+  addThought('🧪 Tests unitaires générés');
+  const el = document.getElementById('tests-content');
+  el.innerHTML = marked.parse(testsOutput);
+  el.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+  document.getElementById('tests-section').style.display = 'block';
+}
+
+function _wrShowExecSummary(summary) {
+  if (!summary) return;
+  addThought('📊 Résumé exécutif disponible');
+  const el = document.getElementById('exec-summary-content');
+  el.innerHTML = marked.parse(summary);
+  document.getElementById('exec-summary-section').style.display = 'block';
+}
+
+/* ─── SSE streaming launch ─── */
+async function launchWarRoomSSE(query, model, btn) {
+  return new Promise((resolve, reject) => {
+    const stack  = document.getElementById('wr-stack').value.trim() || undefined;
+    const body   = JSON.stringify({
+      query, model, lang: currentLang,
+      selected_experts: selectedExperts,
+      mode: warRoomMode,
+      ...(stack ? { stack } : {}),
+    });
+
+    fetch('/api/warroom/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    }).then(res => {
+      if (!res.ok) { reject(new Error('HTTP ' + res.status)); return; }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      function pump() {
+        reader.read().then(({ done, value }) => {
+          if (done) { resolve(); return; }
+          buffer += decoder.decode(value, { stream: true });
+          const parts = buffer.split('\n\n');
+          buffer = parts.pop();
+          parts.forEach(part => {
+            if (!part.startsWith('data:')) return;
+            try {
+              const ev = JSON.parse(part.slice(5).trim());
+              handleSSEEvent(ev, btn);
+              if (ev.event === 'done' || ev.event === 'error') {
+                resolve();
+              }
+            } catch(e) { console.warn('SSE parse error', e); }
+          });
+          pump();
+        }).catch(reject);
+      }
+      pump();
+    }).catch(reject);
+  });
+}
+
+function handleSSEEvent(ev, btn) {
+  switch (ev.event) {
+    case 'pm_ready':
+      _wrShowPM(ev.pm);
+      setProgressStep('analyse');
+      break;
+    case 'experts_ready':
+      _wrShowExperts(ev.experts, ev.strategy, ev.proposals);
+      setProgressStep('synthese');
+      addThought('🏆 Synthèse en cours…', true);
+      warRoomData = { experts: ev.experts, proposals: ev.proposals };
+      break;
+    case 'debate_ready':
+      addThought('⚡ Débat inter-experts terminé');
+      break;
+    case 'synthesis_ready':
+      _wrShowSynthesis(ev.synthesis);
+      if (warRoomData) warRoomData.synthesis = ev.synthesis;
+      addThought('💻 Programmeur en cours…', true);
+      break;
+    case 'advocate_ready':
+      addThought('😈 Avocat du Diable : critique intégrée');
+      break;
+    case 'code_ready':
+      _wrShowCode(ev.programmer_output, ev.files, ev.complete, null);
+      if (warRoomData) { warRoomData.programmer_output = ev.programmer_output; warRoomData.files = ev.files; }
+      break;
+    case 'review_ready':
+      _wrShowReview(ev.review_comments, ev.programmer_output, ev.files);
+      if (warRoomData) warRoomData.programmer_output = ev.programmer_output;
+      break;
+    case 'tests_ready':
+      _wrShowTests(ev.tests_output);
+      break;
+    case 'done':
+      _wrShowExecSummary(ev.executive_summary);
+      // Stack badge from done event
+      if (ev.stack_detected) {
+        const sb = document.getElementById('wr-stack-badge');
+        sb.textContent = '🔧 ' + ev.stack_detected;
+        sb.style.display = 'inline';
+      }
+      ['ps-pm','ps-analyse','ps-debat','ps-synthese','ps-code'].forEach(id => {
+        document.getElementById(id).className = 'progress-step done';
+      });
+      addThought('🎉 War Room terminée !', true);
+      showToast('War Room terminée !', 'success');
+      btn.disabled = false; btn.textContent = '🚀 Relancer';
+      break;
+    case 'error':
+      showToast('Erreur : ' + (ev.message || 'inconnue'), 'error');
+      addThought('❌ Erreur : ' + (ev.message || ''));
+      btn.disabled = false; btn.textContent = '🚀 Lancer';
+      break;
+  }
+}
+
+/* ─── Sync (fallback) launch ─── */
+async function launchWarRoomSync(query, model, btn) {
+  const stack = document.getElementById('wr-stack').value.trim() || undefined;
+  const res   = await fetch('/api/warroom', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      query, model, lang: currentLang,
+      selected_experts: selectedExperts,
+      mode: warRoomMode,
+      ...(stack ? { stack } : {}),
+    }),
+  });
+  const data = await res.json();
+  if (data.error) { showToast(data.error, 'error'); return; }
+
+  warRoomData = data;
+  _wrShowPM(data.pm || {});
+  setProgressStep('analyse');
+  addThought('✅ Stratégie : ' + (data.strategy || ''));
+  _wrShowExperts(data.experts || [], data.strategy, data.proposals || []);
+  _wrShowSynthesis(data.synthesis || '');
+  _wrShowCode(data.programmer_output || '', data.files || [], data.complete, data.meta?.stack);
+  if (data.review_comments) _wrShowReview(data.review_comments, null, null);
+  _wrShowTests(data.tests_output);
+  _wrShowExecSummary(data.executive_summary);
+  ['ps-pm','ps-analyse','ps-debat','ps-synthese','ps-code'].forEach(id => {
+    document.getElementById(id).className = 'progress-step done';
+  });
+  addThought('🎉 War Room terminée !', true);
+  showToast('War Room terminée !', 'success');
+  btn.disabled = false; btn.textContent = '🚀 Relancer';
+}
+
+async function launchWarRoom() {
+  const query = document.getElementById('warroom-input').value.trim();
+  if (!query) return showToast('Décris ton problème d\'abord', 'error');
+
+  const model = document.getElementById('model-select').value;
+  const btn   = document.getElementById('wr-launch-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Analyse…';
+
+  _wrResetUI();
+  addThought('📡 Lancement War Room en mode ' + warRoomMode + '…', true);
+  if (selectedExperts.length > 0) addThought(`🎭 Experts sélectionnés : ${selectedExperts.join(', ')}`);
+  else addThought('🤖 Mode auto — l\'IA choisira les meilleurs experts');
+
+  const useStream = document.getElementById('wr-stream-toggle')?.checked ?? true;
+  try {
+    if (useStream) await launchWarRoomSSE(query, model, btn);
+    else           await launchWarRoomSync(query, model, btn);
+  } catch(e) {
+    showToast('Erreur réseau : ' + e.message, 'error');
+    addThought('❌ Erreur : ' + e.message);
+    btn.disabled = false; btn.textContent = '🚀 Lancer';
+  }
+}
+
+/* ─── Refine ─── */
+async function launchRefine() {
+  const refinement = document.getElementById('refine-input').value.trim();
+  if (!refinement) return showToast('Décris ce que tu veux affiner', 'error');
+  if (!warRoomSynth) return showToast('Lance d\'abord une War Room', 'error');
+
+  const btn   = document.getElementById('wr-refine-btn');
+  const query = document.getElementById('warroom-input').value.trim();
+  const model = document.getElementById('model-select').value;
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+
+  try {
+    const res  = await fetch('/api/warroom/refine', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refinement, synthesis: warRoomSynth, query, model, lang: currentLang }),
+    });
+    const data = await res.json();
+    if (data.error) { showToast(data.error, 'error'); return; }
+
+    const progEl = document.getElementById('programmer-content');
+    progEl.innerHTML = marked.parse(data.programmer_output || '');
+    progEl.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+    if (warRoomData) warRoomData.programmer_output = data.programmer_output;
+    // Update files
+    if (data.files?.length) {
+      const listEl = document.getElementById('wr-files-list');
+      listEl.innerHTML = data.files.map(f => `
+        <div class="wr-file-chip ${f.syntax_valid ? 'valid' : 'invalid'}">
+          <span>📄 ${escHtml(f.filename)}</span>
+          <span class="fc-lang">${escHtml(f.language)}</span>
+          <span class="fc-lines">${f.line_count}L</span>
+        </div>`).join('');
+      document.getElementById('wr-files-section').style.display = 'block';
+    }
+    document.getElementById(data.complete ? 'wr-complete-badge' : 'wr-incomplete-badge').style.display = 'inline';
+    addThought('🔧 Code raffiné : ' + (data.meta?.refinement || refinement));
+    showToast('Code raffiné ✓ (' + (data.meta?.duration_ms || 0) + 'ms)', 'success');
+    document.getElementById('refine-input').value = '';
+  } catch(e) {
+    showToast('Erreur raffinage : ' + e.message, 'error');
+  } finally {
+    btn.disabled = false; btn.textContent = '🔧 Affiner';
+  }
+}
+
+/* ─── Feedback ─── */
+function setFeedbackScore(score) {
+  feedbackScore = score;
+  document.querySelectorAll('.wr-star').forEach((btn, i) => {
+    btn.classList.toggle('active', i < score);
+  });
+}
+
+async function submitFeedback() {
+  if (!feedbackScore) return showToast('Sélectionne une note (1-5 ⭐)', 'error');
+  const comment = document.getElementById('feedback-comment').value.trim();
+  const query   = document.getElementById('warroom-input').value.trim();
+  const btn     = document.getElementById('wr-feedback-btn');
+  btn.disabled  = true;
+  try {
+    const res  = await fetch('/api/warroom/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ score: feedbackScore, comment, query }),
+    });
+    const data = await res.json();
+    if (data.recorded) {
+      showToast('Merci ! Note envoyée ⭐', 'success');
+      const avgEl = document.getElementById('feedback-avg');
+      avgEl.textContent = `Moyenne globale : ${data.avg_score}/5 (${data.total} avis)`;
+      avgEl.style.display = 'block';
+      // Reset stars
+      feedbackScore = 0;
+      document.querySelectorAll('.wr-star').forEach(b => b.classList.remove('active'));
+      document.getElementById('feedback-comment').value = '';
+    }
+  } catch(e) {
+    showToast('Erreur envoi feedback', 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+let selectedExperts  = [];   // array of expert IDs (max 3)
+let expertCatalog    = {};   // { id: { role, emoji, family, description, specialty } }
+let expertFamilies   = [];   // [{ id, label, color }]
+let currentDetailId  = null;
+let draggedExpertId  = null;
+
+// Family labels (fallback if API unavailable)
+const FAMILY_LABELS = {
+  informatique: "💻 Informatique & Tech",
+  art:          "🎨 Art & Design",
+  business:     "💼 Business & Management",
+  sante:        "🏥 Santé & Bien-être",
+  sciences:     "🔬 Sciences",
+  education:    "📚 Éducation & Coaching",
+  societe:      "🌍 Société & Environnement",
+};
+
+async function loadExpertCatalog() {
+  try {
+    const res  = await fetch('/api/experts');
+    const data = await res.json();
+    expertCatalog  = data.experts  || {};
+    expertFamilies = data.families || [];
+  } catch {
+    expertFamilies = Object.entries(FAMILY_LABELS).map(([id,label]) => ({ id, label, color: '#64748b' }));
+  }
+  renderExpertCatalog();
+}
+
+function renderExpertCatalog(filter = '') {
+  const container = document.getElementById('expert-catalog');
+  if (!container) return;
+  container.innerHTML = '';
+
+  const filterLow = filter.toLowerCase();
+
+  expertFamilies.forEach(fam => {
+    const members = Object.entries(expertCatalog).filter(([, e]) =>
+      e.family === fam.id &&
+      (!filter || e.role.toLowerCase().includes(filterLow) || e.description.toLowerCase().includes(filterLow))
+    );
+    if (!members.length) return;
+
+    const group = document.createElement('div');
+    group.className = 'family-group';
+    group.dataset.family = fam.id;
+
+    const header = document.createElement('div');
+    header.className = 'family-header';
+    header.style.color = fam.color;
+    header.innerHTML = `<span>${fam.label}</span><span class="family-toggle">▼</span>`;
+    header.onclick = () => group.classList.toggle('collapsed');
+
+    const cards = document.createElement('div');
+    cards.className = 'family-cards';
+
+    members.forEach(([id, e]) => {
+      const card = document.createElement('div');
+      card.className  = 'expert-mini-card';
+      card.draggable  = true;
+      card.dataset.id = id;
+      card.innerHTML  = `
+        <button class="emc-detail-btn" title="Voir la fiche complète" onclick="openExpertDetail('${id}',event)">ℹ</button>
+        <div class="emc-top">
+          <span class="emc-emoji">${e.emoji}</span>
+          <span class="emc-role">${e.role}</span>
+        </div>
+        <div class="emc-desc">${e.description}</div>`;
+
+      card.addEventListener('dragstart', e2 => {
+        draggedExpertId = id;
+        card.classList.add('dragging');
+        e2.dataTransfer.effectAllowed = 'copy';
+        e2.dataTransfer.setData('text/plain', id);
+      });
+      card.addEventListener('dragend', () => card.classList.remove('dragging'));
+
+      cards.appendChild(card);
+    });
+
+    group.appendChild(header);
+    group.appendChild(cards);
+    container.appendChild(group);
+  });
+}
+
+function filterExperts(val) { renderExpertCatalog(val); }
+
+/* ── Drop zone handlers ── */
+function onDragOver(e) {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'copy';
+  document.getElementById('expert-drop-zone').classList.add('drag-over');
+}
+function onDragLeave(e) {
+  if (!e.currentTarget.contains(e.relatedTarget))
+    document.getElementById('expert-drop-zone').classList.remove('drag-over');
+}
+function onDrop(e) {
+  e.preventDefault();
+  document.getElementById('expert-drop-zone').classList.remove('drag-over');
+  const id = draggedExpertId || e.dataTransfer.getData('text/plain');
+  if (id) addExpertToSlot(id);
+}
+
+/* ── Slot management ── */
+function addExpertToSlot(id) {
+  const maxSlots = WR_MODE_SLOTS[warRoomMode] || 3;
+  if (selectedExperts.includes(id)) { showToast('Expert déjà sélectionné', 'warn'); return; }
+  if (selectedExperts.length >= maxSlots) { showToast('Maximum ' + maxSlots + ' experts pour le mode ' + warRoomMode, 'warn'); return; }
+  if (!expertCatalog[id]) return;
+  selectedExperts.push(id);
+  renderDropZone();
+}
+function removeExpertFromSlot(id) {
+  selectedExperts = selectedExperts.filter(e => e !== id);
+  renderDropZone();
+}
+function refreshDropZone() { renderDropZone(); } // alias compat
+function renderDropZone() {
+  const maxSlots = WR_MODE_SLOTS[warRoomMode] || 3;
+  const zone = document.getElementById('expert-drop-zone');
+  const cnt  = document.getElementById('slot-count');
+  zone.innerHTML = '';
+  if (selectedExperts.length === 0) {
+    zone.classList.remove('full');
+    const ph = document.createElement('div');
+    ph.id = 'drop-placeholder';
+    ph.innerHTML = '⬆️ Glisse des experts ici • ou clique sur <strong>Ajouter</strong> dans leur fiche';
+    zone.appendChild(ph);
+  } else {
+    zone.classList.toggle('full', selectedExperts.length >= maxSlots);
+    selectedExperts.forEach(id => {
+      const e    = expertCatalog[id];
+      if (!e) return;
+      const slot = document.createElement('div');
+      slot.className = 'expert-slot';
+      slot.innerHTML = `<span>${e.emoji}</span><span>${e.role}</span><button class="slot-remove" onclick="removeExpertFromSlot('${id}')" title="Retirer">✕</button>`;
+      zone.appendChild(slot);
+    });
+    if (selectedExperts.length < maxSlots) {
+      const ph2 = document.createElement('div');
+      ph2.style.cssText = 'font-size:10px;color:var(--muted);margin-left:4px;';
+      ph2.textContent = `+ ${maxSlots - selectedExperts.length} slot(s) libre(s)`;
+      zone.appendChild(ph2);
+    }
+  }
+  zone.ondragover  = onDragOver;
+  zone.ondragleave = onDragLeave;
+  zone.ondrop      = onDrop;
+  if (cnt) cnt.textContent = `${selectedExperts.length}/${maxSlots}`;
+  const hint = document.getElementById('expert-selection-hint');
+  if (hint) {
+    if (selectedExperts.length === 0) {
+      hint.textContent = `0 expert sélectionné — l'IA choisira les ${maxSlots} meilleurs profils automatiquement.`;
+      hint.style.color = 'var(--muted)';
+    } else {
+      hint.textContent = `✅ ${selectedExperts.length}/${maxSlots} expert(s)${selectedExperts.length < maxSlots ? " — l'IA complétera les profils manquants" : " — War Room 100% manuelle !"}`;
+      hint.style.color = 'var(--war)';
+    }
+  }
+  if (currentDetailId) {
+    const addBtn = document.getElementById('edb-add-btn');
+    if (addBtn) addBtn.disabled = selectedExperts.includes(currentDetailId) || selectedExperts.length >= maxSlots;
+  }
+}
+/* ── Expert Detail Modal ── */
+function openExpertDetail(id, evt) {
+  if (evt) { evt.stopPropagation(); evt.preventDefault(); }
+  const e = expertCatalog[id];
+  if (!e) return;
+  currentDetailId = id;
+  const maxSlots = WR_MODE_SLOTS[warRoomMode] || 3;
+  const fam = expertFamilies.find(f => f.id === e.family);
+  document.getElementById('edb-emoji').textContent    = e.emoji;
+  document.getElementById('edb-role').textContent     = e.role;
+  document.getElementById('edb-family').textContent   = fam ? fam.label : e.family;
+  document.getElementById('edb-specialty').textContent = e.specialty;
+  const addBtn = document.getElementById('edb-add-btn');
+  addBtn.disabled = selectedExperts.includes(id) || selectedExperts.length >= maxSlots;
+  addBtn.textContent = selectedExperts.includes(id) ? '✅ Déjà sélectionné' : '➕ Ajouter à la sélection';
+  document.getElementById('expert-detail-modal').classList.add('active');
+}
+function closeExpertDetail() {
+  document.getElementById('expert-detail-modal').classList.remove('active');
+  currentDetailId = null;
+}
+function addExpertFromDetail() {
+  if (!currentDetailId) return;
+  addExpertToSlot(currentDetailId);
+  closeExpertDetail();
+}
+
+/* Load catalog on War Room open */
+
+function sendSynthesisToChat() {
+  if (!warRoomData) return;
+  const text = '**⚔️ War Room — Plan d\'Action Final**\n\n' + warRoomData.synthesis;
+  closeWarRoom();
+  document.getElementById('welcome')?.remove();
+  appendMessage('bot', text);
+  showToast('Synthèse ajoutée au chat', 'success');
+}
+
+function sendProgrammerToChat() {
+  if (!warRoomData?.programmer_output) return;
+  const text = '**💻 War Room — Code Généré par l\'Agent Programmeur**\n\n' + warRoomData.programmer_output;
+  closeWarRoom();
+  document.getElementById('welcome')?.remove();
+  appendMessage('bot', text);
+  showToast('Code ajouté au chat', 'success');
+}
+
+function copyProgrammerCode() {
+  if (!warRoomData?.programmer_output) return;
+  navigator.clipboard.writeText(warRoomData.programmer_output)
+    .then(() => showToast('Code copié !', 'success'))
+    .catch(() => showToast('Erreur lors de la copie', 'error'));
+}
+
+/* ===================================================
+   😈 AVOCAT DU DIABLE
+   =================================================== */
+function openAdvocate() {
+  document.getElementById('advocate-overlay').classList.add('active');
+  const msg = document.getElementById('message-input').value.trim();
+  if (msg) document.getElementById('advocate-input').value = msg;
+  setTimeout(() => document.getElementById('advocate-input').focus(), 100);
+}
+function closeAdvocate() {
+  document.getElementById('advocate-overlay').classList.remove('active');
+}
+
+async function launchAdvocate() {
+  const topic = document.getElementById('advocate-input').value.trim();
+  if (!topic) return showToast('Entre un sujet à critiquer', 'error');
+
+  const model = document.getElementById('model-select').value;
+  const btn   = document.getElementById('adv-btn');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+
+  document.getElementById('advocate-placeholder').style.display = 'none';
+  const result = document.getElementById('advocate-result');
+  result.style.display = 'block';
+  result.innerHTML = '<div style="text-align:center;padding:30px;color:var(--muted);"><span class="spinner"></span><br><br>L\'Avocat du Diable réfléchit…</div>';
+
+  try {
+    const res  = await fetch('/api/advocate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ topic, model })
+    });
+    const data = await res.json();
+    if (data.error) {
+      result.innerHTML = `<p style="color:var(--danger)">${escHtml(data.error)}</p>`;
+    } else {
+      result.innerHTML = marked.parse(data.critique);
+      result.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+    }
+  } catch(e) {
+    result.innerHTML = `<p style="color:var(--danger)">Erreur réseau: ${escHtml(e.message)}</p>`;
+  }
+
+  btn.disabled = false; btn.textContent = '😈 Critiquer';
+}
+
+
+
+/* ===================================================
+   UTILS
+   =================================================== */
+function prefillCurrentMessage() {
+  const msg = document.getElementById('message-input').value.trim();
+  if (!msg) return showToast('Aucun message à utiliser', 'warn');
+  document.getElementById('warroom-input').value  = msg;
+  document.getElementById('advocate-input').value = msg;
+  showToast('Message copié dans les outils', 'success');
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/'/g,"&#39;").replace(/"/g,'&quot;');
+}
+function showToast(msg, type = '') {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.className = 'show ' + type;
+  clearTimeout(t._tid);
+  t._tid = setTimeout(() => t.className = '', 3000);
+}
+
+// Fermer les overlays avec Escape
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    closeSkillModal();
+    closeWarRoom();
+    closeAdvocate();
+  }
+});
+
+// Fermer en cliquant en dehors du modal
+['warroom-overlay','advocate-overlay'].forEach(id => {
+  document.getElementById(id).addEventListener('click', function(e) {
+    if (e.target === this) {
+      closeWarRoom(); closeAdvocate();
+    }
+  });
+});
+
+/* ===================================================
+   INIT
+   =================================================== */
+(async () => {
+  await loadUser();
+  try {
+    const res  = await fetch('/api/history');
+    const data = await res.json();
+    if (data.messages?.length) {
+      document.getElementById('welcome')?.remove();
+      data.messages.forEach(m => appendMessage(m.role, m.content));
+      updateStats(data.messages.length, data.estimated_tokens);
+    }
+    if (data.system_prompt) {
+      document.getElementById('system-prompt').value = data.system_prompt;
+      hasContext = true;
+      document.getElementById('context-indicator').style.display = 'flex';
+      document.getElementById('stat-ctx').textContent = 'Oui';
+    }
+    if (data.skills?.length) { skills = data.skills; renderSkills(); }
+    if (data.model) {
+      document.getElementById('model-select').value      = data.model;
+      document.getElementById('model-badge').textContent = data.model;
+    }
+    if (data.lang) {
+      currentLang = data.lang;
+      const sel = document.getElementById('lang-select');
+      if (sel) sel.value = data.lang;
+    }
+  } catch (e) { console.error('Init error:', e); }
+})();
+
+/* ===================================================
+   🐍 IDE PYTHON
+   =================================================== */
+const ideEditor = document.getElementById('ide-editor');
+let ideLastStdout = '';
+let ideLastStderr = '';
+let ideAIHistory  = [];   // { role, content }
+
+function openIDE() { document.getElementById('ide-overlay').classList.add('active'); ideEditor.focus(); }
+function closeIDE() { document.getElementById('ide-overlay').classList.remove('active'); }
+
+/* Tab indentation in editor */
+ideEditor.addEventListener('keydown', e => {
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    const start = ideEditor.selectionStart;
+    const end   = ideEditor.selectionEnd;
+    ideEditor.value = ideEditor.value.substring(0, start) + '    ' + ideEditor.value.substring(end);
+    ideEditor.selectionStart = ideEditor.selectionEnd = start + 4;
+  }
+});
+
+/* Run code */
+async function ideRun() {
+  const code = ideEditor.value.trim();
+  if (!code) return showToast('Éditeur vide', 'error');
+  const runBtn = document.getElementById('ide-run-btn');
+  const icon   = document.getElementById('ide-run-icon');
+  runBtn.disabled = true;
+  icon.textContent = '⏳';
+  document.getElementById('ide-status').textContent = 'Exécution…';
+  document.getElementById('ide-output-content').innerHTML = '<span class="out-meta">Exécution en cours…</span>';
+
+  try {
+    const res  = await fetch('/api/execute', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
+    });
+    const data = await res.json();
+
+    if (data.error) {
+      document.getElementById('ide-output-content').innerHTML =
+        `<span class="out-error">❌ ${escHtml(data.error)}</span>`;
+      document.getElementById('ide-status').textContent = '❌ Erreur';
+      showToast(data.error, 'error');
+      return;
+    }
+
+    ideLastStdout = data.stdout || '';
+    ideLastStderr = data.stderr || '';
+    const dur     = data.duration_ms;
+    document.getElementById('ide-duration').textContent = `${dur}ms`;
+
+    /* update output tab */
+    const errTab = document.getElementById('ide-tab-err');
+    errTab.classList.toggle('error', !!ideLastStderr);
+
+    ideShowTab('out');
+
+    const status = data.returncode === 0 ? `✅ ${dur}ms` : `⚠ code ${data.returncode}`;
+    document.getElementById('ide-status').textContent = status;
+    showToast(data.returncode === 0 ? 'Exécution réussie' : 'Terminé avec erreurs', data.returncode === 0 ? 'success' : 'warn');
+
+  } catch (err) {
+    document.getElementById('ide-output-content').innerHTML = `<span class="out-error">Erreur réseau : ${escHtml(String(err))}</span>`;
+    document.getElementById('ide-status').textContent = '❌';
+  } finally {
+    runBtn.disabled = false;
+    icon.textContent = '▶';
+  }
+}
+
+let ideInstalledPackages = JSON.parse(localStorage.getItem('ide_installed_pkgs') || '[]');
+
+function ideShowTab(tab) {
+  document.getElementById('ide-tab-out').classList.toggle('active', tab === 'out');
+  document.getElementById('ide-tab-err').classList.toggle('active', tab === 'err');
+  document.getElementById('ide-tab-pkg').classList.toggle('active', tab === 'pkg');
+  const out    = document.getElementById('ide-output-content');
+  const pkgPnl = document.getElementById('ide-pkg-panel');
+
+  if (tab === 'pkg') {
+    out.style.display    = 'none';
+    pkgPnl.style.display = 'flex';
+    pkgPnl.style.flexDirection = 'column';
+    renderInstalledBadges();
+  } else {
+    out.style.display    = 'block';
+    pkgPnl.style.display = 'none';
+    if (tab === 'out') {
+      out.innerHTML = ideLastStdout
+        ? `<pre class="out-success" style="white-space:pre-wrap;margin:0;">${escHtml(ideLastStdout)}</pre>`
+        : '<span class="out-empty">Aucune sortie stdout.</span>';
+    } else {
+      out.innerHTML = ideLastStderr
+        ? `<pre class="out-error" style="white-space:pre-wrap;margin:0;">${escHtml(ideLastStderr)}</pre>`
+        : '<span class="out-empty" style="color:var(--success);">Aucune erreur. ✅</span>';
+    }
+  }
+}
+
+function renderInstalledBadges() {
+  const list = document.getElementById('ide-installed-list');
+  if (!list) return;
+  if (!ideInstalledPackages.length) {
+    list.innerHTML = '<span style="font-size:10px;color:var(--muted);">Aucun package installé dans cette session.</span>';
+    return;
+  }
+  list.innerHTML = ideInstalledPackages.map(p =>
+    `<span style="display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:10px;
+      background:rgba(139,92,246,.12);border:1px solid rgba(139,92,246,.35);
+      font-size:10px;font-family:'JetBrains Mono',monospace;color:#a78bfa;">
+      📦 ${escHtml(p)}
+      <button onclick="ideUninstall('${escHtml(p)}')"
+        style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:11px;padding:0 2px;line-height:1;transition:color .15s;"
+        onmouseover="this.style.color='var(--danger)'" onmouseout="this.style.color='var(--muted)'">✕</button>
+    </span>`
+  ).join('');
+}
+
+async function ideInstall() {
+  const raw     = document.getElementById('ide-pkg-input').value.trim();
+  if (!raw) return showToast('Saisis un nom de package', 'error');
+  const packages = raw.split(',').map(p => p.trim()).filter(Boolean);
+  if (!packages.length) return;
+
+  const btn    = document.getElementById('ide-install-btn');
+  const icon   = document.getElementById('ide-install-icon');
+  const outDiv = document.getElementById('ide-install-output');
+  btn.disabled = true;
+  icon.textContent = '⏳';
+  outDiv.innerHTML = `<span style="color:#a78bfa;">📦 Installation de : ${escHtml(packages.join(', '))}…</span>\n`;
+
+  try {
+    const res  = await fetch('/api/ide/install', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ packages }),
+    });
+    const data = await res.json();
+
+    if (data.error) {
+      outDiv.innerHTML += `<span class="out-error">❌ ${escHtml(data.error)}</span>`;
+      showToast(data.error, 'error');
+      return;
+    }
+
+    const lines = (data.output || '').split('\n');
+    const colored = lines.map(l => {
+      if (l.startsWith('Successfully installed'))
+        return `<span style="color:#4ade80;">${escHtml(l)}</span>`;
+      if (l.includes('already satisfied') || l.includes('Requirement already'))
+        return `<span style="color:#fbbf24;">${escHtml(l)}</span>`;
+      if (l.startsWith('ERROR') || l.startsWith('error'))
+        return `<span class="out-error">${escHtml(l)}</span>`;
+      return `<span style="color:#8b949e;">${escHtml(l)}</span>`;
+    }).join('\n');
+    outDiv.innerHTML = `<pre style="white-space:pre-wrap;margin:0;">${colored}</pre>`;
+
+    /* update installed list */
+    if (data.installed?.length) {
+      data.installed.forEach(p => {
+        if (!ideInstalledPackages.includes(p)) ideInstalledPackages.push(p);
+      });
+      try { localStorage.setItem('ide_installed_pkgs', JSON.stringify(ideInstalledPackages)); } catch {}
+      renderInstalledBadges();
+      document.getElementById('ide-pkg-input').value = '';
+      showToast(`✅ ${data.installed.join(', ')} installé(s)`, 'success');
+    } else {
+      showToast('Installation terminée', 'success');
+    }
+
+  } catch (err) {
+    outDiv.innerHTML += `<span class="out-error">Erreur réseau : ${escHtml(String(err))}</span>`;
+    showToast('Erreur réseau', 'error');
+  } finally {
+    btn.disabled = false;
+    icon.textContent = '📦';
+  }
+}
+
+async function ideUninstall(pkg) {
+  if (!confirm(`Désinstaller "${pkg}" ?`)) return;
+  const outDiv = document.getElementById('ide-install-output');
+  outDiv.innerHTML = `<span style="color:#f87171;">🗑 Désinstallation de ${escHtml(pkg)}…</span>`;
+  try {
+    const res  = await fetch('/api/ide/uninstall', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ package: pkg }),
+    });
+    const data = await res.json();
+    outDiv.innerHTML = `<pre style="white-space:pre-wrap;margin:0;color:#8b949e;">${escHtml(data.output || data.error || '')}</pre>`;
+    ideInstalledPackages = ideInstalledPackages.filter(p => p !== pkg);
+    try { localStorage.setItem('ide_installed_pkgs', JSON.stringify(ideInstalledPackages)); } catch {}
+    renderInstalledBadges();
+    showToast(`${pkg} désinstallé`, 'success');
+  } catch (err) {
+    outDiv.innerHTML = `<span class="out-error">Erreur : ${escHtml(String(err))}</span>`;
+  }
+}
+
+function ideSendToChat() {
+  const code = ideEditor.value.trim();
+  if (!code) return showToast('Éditeur vide', 'error');
+  closeIDE();
+  document.getElementById('welcome')?.remove();
+  const filename = document.getElementById('ide-filename').value || 'script.py';
+  appendMessage('bot', `**🐍 Code Python — ${escHtml(filename)}**\n\`\`\`python\n${code}\n\`\`\``);
+  showToast('Code envoyé dans le chat', 'success');
+}
+
+/* ── IDE AI assistant ── */
+function clearIdeAI() {
+  ideAIHistory = [];
+  document.getElementById('ide-ai-messages').innerHTML = `
+    <div class="ide-ai-msg bot">Chat IA réinitialisé. Prêt à t'aider !</div>`;
+}
+
+function ideAIQuick(prompt) {
+  const input = document.getElementById('ide-ai-input');
+  input.value = prompt;
+  ideAISend();
+}
+
+function _ideAddMsg(role, html, rawCode) {
+  const wrap = document.createElement('div');
+  wrap.className = `ide-ai-msg ${role}`;
+  wrap.innerHTML = html;
+  if (rawCode && role === 'bot') {
+    const insertBtn = document.createElement('button');
+    insertBtn.className = 'ide-ai-insert-btn';
+    insertBtn.textContent = '⬇ Insérer dans l\'éditeur';
+    insertBtn.onclick = () => {
+      ideEditor.value = rawCode;
+      ideEditor.focus();
+      showToast('Code inséré dans l\'éditeur', 'success');
+    };
+    wrap.appendChild(insertBtn);
+  }
+  const container = document.getElementById('ide-ai-messages');
+  container.appendChild(wrap);
+  container.scrollTop = container.scrollHeight;
+  return wrap;
+}
+
+async function ideAISend() {
+  const input   = document.getElementById('ide-ai-input');
+  const userMsg = input.value.trim();
+  if (!userMsg) return;
+  const sendBtn = document.getElementById('ide-ai-send-btn');
+  input.value = '';
+  input.style.height = 'auto';
+  sendBtn.disabled = true;
+
+  const code    = ideEditor.value.trim();
+  const stdout  = ideLastStdout;
+  const stderr  = ideLastStderr;
+
+  _ideAddMsg('user', escHtml(userMsg));
+
+  const systemContent = `Tu es un assistant Python expert intégré dans un IDE. 
+Réponds TOUJOURS en français.
+Tu as accès au code courant dans l'éditeur et à la dernière sortie d'exécution.
+Quand tu génères du code, utilise des blocs \`\`\`python ... \`\`\`.
+Sois concis, précis et fournis du code fonctionnel.`;
+
+  const contextMsg = `CODE ACTUEL DANS L'ÉDITEUR :
+\`\`\`python
+${code || '(éditeur vide)'}
+\`\`\`
+${stdout ? `\nDERNIÈRE SORTIE STDOUT :\n${stdout.slice(0, 1000)}` : ''}
+${stderr ? `\nDERNIÈRE SORTIE STDERR :\n${stderr.slice(0, 500)}` : ''}`;
+
+  ideAIHistory.push({ role: 'user', content: contextMsg + '\n\n' + userMsg });
+
+  /* streaming placeholder */
+  const placeholder = _ideAddMsg('bot', '<span style="color:var(--muted);font-size:11px;">⏳ Génération…</span>');
+
+  try {
+    const model = document.getElementById('model-select')?.value || 'openai/gpt-oss-120b:free';
+    const res   = await fetch('/api/ide/ask', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: [
+          { role: 'system', content: systemContent },
+          ...ideAIHistory,
+        ],
+        model,
+      }),
+    });
+
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    const fullText = data.reply || '';
+
+    ideAIHistory.push({ role: 'assistant', content: fullText });
+
+    placeholder.innerHTML = ideFormatAIText(fullText);
+
+    /* extract first code block for insert button */
+    const codeMatch = fullText.match(/```(?:python)?\n([\s\S]*?)```/);
+    if (codeMatch) {
+      const insertBtn = document.createElement('button');
+      insertBtn.className = 'ide-ai-insert-btn';
+      insertBtn.textContent = '⬇ Insérer dans l\'éditeur';
+      const extracted = codeMatch[1].trim();
+      insertBtn.onclick = () => {
+        ideEditor.value = extracted;
+        ideEditor.focus();
+        showToast('Code inséré dans l\'éditeur', 'success');
+      };
+      placeholder.appendChild(insertBtn);
+    }
+    document.getElementById('ide-ai-messages').scrollTop = 999999;
+
+  } catch (err) {
+    placeholder.innerHTML = `<span class="out-error">Erreur : ${escHtml(String(err))}</span>`;
+  } finally {
+    sendBtn.disabled = false;
+  }
+}
+
+function ideFormatAIText(text) {
+  /* Simple markdown-like formatting for IDE AI panel */
+  return text
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/```(?:python)?\n([\s\S]*?)```/g, (_, c) =>
+      `<pre><code>${c}</code></pre>`)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\n/g, '<br/>');
+}
+
+/* Auto-resize IDE AI textarea */
+document.getElementById('ide-ai-input').addEventListener('input', function() {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 90) + 'px';
+});
+
+/* Keyboard shortcut: Ctrl+Enter / Cmd+Enter to run */
+ideEditor.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); ideRun(); }
 });
 </script>
 </body>
-</html>"""
-
-
-def _load_html_template() -> str:
-    path = os.path.join(_BASE, "main.html")
-    with open(path, encoding="utf-8") as fh:
-        return fh.read()
-
-
-# ===========================================================================
-# WAR ROOM — Constantes & helpers
-# ===========================================================================
-
-MAX_RETRIES        = 3
-RETRY_DELAY        = 1.5
-RETRY_BACKOFF      = 2.0
-TOKENS_PM          = 2_500
-TOKENS_ORCHESTRATOR= 2_000
-TOKENS_AGENT       = 2_000
-TOKENS_DEBATE      = 4_000
-TOKENS_ADVOCATE    = 3_500
-TOKENS_SYNTHESIS   = 10_000
-TOKENS_PROGRAMMER  = 64_000
-TOKENS_REVIEWER    = 8_000
-TOKENS_TESTS       = 12_000
-TOKENS_CONTINUATION= 32_000
-TOKENS_SUMMARY     = 1_500
-EXPERTS_TIMEOUT_SECONDS = 300
-FINAL_CODE_END_MARKER   = "__WARROOM_COMPLETE__"
-MAX_QUERY_LENGTH        = 8_000
-
-ALLOWED_MODELS: set[str] = {
-    "claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5",
-    "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-6",
-    DEFAULT_MODEL,
-}
-
-MODE_PRESETS: dict[str, dict] = {
-    "fast": {
-        "num_experts": 1, "debate_rounds": 0, "advocate": False,
-        "reviewer": False, "generate_tests": False, "executive_summary": False,
-        "tokens_agent": 3_000, "tokens_programmer": 16_000,
-    },
-    "balanced": {
-        "num_experts": 3, "debate_rounds": 0, "advocate": True,
-        "reviewer": True, "generate_tests": False, "executive_summary": True,
-        "tokens_agent": 8_000, "tokens_programmer": 64_000,
-    },
-    "full": {
-        "num_experts": 5, "debate_rounds": 1, "advocate": True,
-        "reviewer": True, "generate_tests": True, "executive_summary": True,
-        "tokens_agent": 8_000, "tokens_programmer": 64_000,
-    },
-}
-
-_cache_store:   dict[str, dict]  = {}
-_session_store: dict[str, list]  = {}
-_job_store:     dict[str, dict]  = {}
-_rate_store:    dict[str, list]  = defaultdict(list)
-_feedback_store: list[dict]      = []
-
-CACHE_TTL_SECONDS  = 3600
-RATE_LIMIT_MAX     = 20
-RATE_LIMIT_WINDOW  = 60
-
-
-def _cache_get(key: str) -> dict | None:
-    entry = _cache_store.get(key)
-    if not entry:
-        return None
-    if time.time() > entry["expires_at"]:
-        del _cache_store[key]
-        return None
-    return entry["value"]
-
-
-def _cache_set(key: str, value: dict, ttl: int = CACHE_TTL_SECONDS) -> None:
-    _cache_store[key] = {"value": value, "expires_at": time.time() + ttl}
-
-
-def _cache_key(query: str, model: str, experts: list[str]) -> str:
-    raw = f"{query}|{model}|{'_'.join(sorted(experts))}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:32]
-
-
-def _rate_check(ip: str) -> bool:
-    now = time.time()
-    _rate_store[ip] = [t for t in _rate_store[ip] if now - t < RATE_LIMIT_WINDOW]
-    if len(_rate_store[ip]) >= RATE_LIMIT_MAX:
-        return False
-    _rate_store[ip].append(now)
-    return True
-
-
-def call_llm_with_retry(
-        messages: list[dict], model: str = DEFAULT_MODEL,
-        max_tokens: int = 4_000, step_name: str = "LLM",
-) -> str:
-    delay = RETRY_DELAY
-    last_exc: Exception | None = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            result = call_llm(messages, model=model, max_tokens=max_tokens)
-            if not isinstance(result, str) or not result.strip():
-                raise ValueError("Réponse LLM vide")
-            return result
-        except Exception as exc:
-            last_exc = exc
-            if attempt < MAX_RETRIES:
-                logger.warning("[%s] Tentative %d/%d échouée : %s — retry dans %.1fs",
-                               step_name, attempt, MAX_RETRIES, exc, delay)
-                time.sleep(delay)
-                delay *= RETRY_BACKOFF
-            else:
-                logger.error("[%s] Échec définitif (%d/%d) : %s", step_name, attempt, MAX_RETRIES, exc)
-    raise last_exc  # type: ignore[misc]
-
-
-def _clean_markdown_fences(raw: str) -> str:
-    return re.sub(r"```(?:json|python|javascript|ts|tsx|js|html|bash)?|```", "", raw).strip()
-
-
-def _parse_json_llm(raw: str) -> dict:
-    clean = _clean_markdown_fences(raw)
-    try:
-        return json.loads(clean)
-    except Exception:
-        match = re.search(r"\{.*\}", clean, re.S)
-        if not match:
-            raise
-        return json.loads(match.group(0))
-
-
-def _is_likely_truncated(text: str) -> bool:
-    if not text or len(text.strip()) < 80:
-        return True
-    stripped = text.rstrip()
-    suspicious = ("```", "def ", "class ", "return", "except", "finally",
-                  "else:", "elif ", "for ", "while ", "if ", "{", "[", "(", ",", ":")
-    if any(stripped.endswith(x) for x in suspicious):
-        return True
-    if stripped.count("```") % 2 != 0:
-        return True
-    return FINAL_CODE_END_MARKER not in stripped
-
-
-def _safe_excerpt(text: str, max_chars: int = 8_000) -> str:
-    text = text.strip()
-    return text if len(text) <= max_chars else text[:max_chars] + "\n...[tronqué]"
-
-
-def _normalize_expert_payload(expert: dict[str, Any]) -> dict[str, str]:
-    return {
-        "role":      str(expert.get("role", "Expert")),
-        "emoji":     str(expert.get("emoji", "🔹")),
-        "specialty": str(expert.get("specialty", "Analyse spécialisée")),
-    }
-
-
-def _estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 4)
-
-
-_STACK_KEYWORDS: dict[str, list[str]] = {
-    "python/fastapi":    ["fastapi", "uvicorn", "pydantic", "async def"],
-    "python/flask":      ["flask", "blueprint", "app.route", "jsonify"],
-    "python/django":     ["django", "models.py", "views.py", "urls.py"],
-    "python":            ["python", ".py", "pip", "pandas", "numpy", "pytest"],
-    "typescript/react":  ["react", "tsx", "jsx", "next.js", "nextjs", "vite"],
-    "typescript/node":   ["express", "nestjs", "ts-node", "typescript node"],
-    "typescript":        ["typescript", ".ts", "tsc", "interface ", "type "],
-    "javascript":        ["javascript", "node.js", "nodejs", ".js", "npm", "yarn"],
-    "go":                ["golang", " go ", ".go", "goroutine", "gin"],
-    "rust":              ["rust", "cargo", "tokio", ".rs"],
-    "java":              ["java", "spring", "maven", "gradle", ".java"],
-    "kotlin":            ["kotlin", ".kt", "coroutine"],
-    "swift":             ["swift", "swiftui", "uikit", ".swift"],
-    "sql":               ["sql", "postgres", "mysql", "sqlite", "query"],
-}
-
-
-def _detect_stack(query: str, explicit_stack: str | None = None) -> str | None:
-    if explicit_stack:
-        return explicit_stack
-    q = query.lower()
-    for stack, keywords in _STACK_KEYWORDS.items():
-        if any(kw in q for kw in keywords):
-            return stack
-    return None
-
-
-def _validate_syntax(code: str, lang: str) -> tuple[bool, list[str]]:
-    errors: list[str] = []
-    if lang == "python":
-        try:
-            ast.parse(code)
-            return True, []
-        except SyntaxError as exc:
-            errors.append(f"SyntaxError ligne {exc.lineno}: {exc.msg}")
-            return False, errors
-    opens  = code.count("{") + code.count("(") + code.count("[")
-    closes = code.count("}") + code.count(")") + code.count("]")
-    if abs(opens - closes) > 3:
-        errors.append(f"Déséquilibre parenthèses : {opens} ouvrantes / {closes} fermantes")
-    return len(errors) == 0, errors
-
-
-def _extract_files(programmer_output: str) -> list[dict]:
-    files: list[dict] = []
-    pattern = re.compile(r"###\s*FILE:\s*(\S+)\s*\n```(\w*)\n(.*?)```", re.S)
-    for match in pattern.finditer(programmer_output):
-        filename, lang_hint, content = match.group(1), match.group(2).lower(), match.group(3)
-        if not lang_hint:
-            ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-            lang_hint = {
-                "py": "python", "ts": "typescript", "tsx": "typescript",
-                "js": "javascript", "jsx": "javascript", "go": "go",
-                "rs": "rust", "java": "java", "kt": "kotlin",
-                "swift": "swift", "sql": "sql", "sh": "bash", "html": "html", "css": "css",
-            }.get(ext, ext)
-        valid, errs = _validate_syntax(content, lang_hint)
-        files.append({
-            "filename": filename, "language": lang_hint, "content": content.strip(),
-            "line_count": content.count("\n") + 1, "syntax_valid": valid, "syntax_errors": errs,
-        })
-    if not files:
-        code_match = re.search(r"```(\w*)\n(.*?)```", programmer_output, re.S)
-        if code_match:
-            lang_hint = code_match.group(1).lower() or "text"
-            content   = code_match.group(2)
-            valid, errs = _validate_syntax(content, lang_hint)
-            files.append({
-                "filename": f"output.{lang_hint or 'txt'}", "language": lang_hint,
-                "content": content.strip(), "line_count": content.count("\n") + 1,
-                "syntax_valid": valid, "syntax_errors": errs,
-            })
-    return files
-
-
-def _clean_programmer_output(raw: str) -> str:
-    return raw.replace(FINAL_CODE_END_MARKER, "").rstrip()
-
-
-# ===========================================================================
-# WAR ROOM — Expert profiles
-# ===========================================================================
-
-EXPERT_FAMILIES: list[dict] = [
-    {"id": "informatique", "label": "💻 Informatique & Tech",       "color": "#3b82f6"},
-    {"id": "art",          "label": "🎨 Art & Design",              "color": "#ec4899"},
-    {"id": "business",     "label": "💼 Business & Management",     "color": "#f97316"},
-    {"id": "sante",        "label": "🏥 Santé & Bien-être",         "color": "#22c55e"},
-    {"id": "sciences",     "label": "🔬 Sciences",                   "color": "#06b6d4"},
-    {"id": "education",    "label": "📚 Éducation & Coaching",      "color": "#a855f7"},
-    {"id": "societe",      "label": "🌍 Société & Environnement",   "color": "#f59e0b"},
-]
-
-EXPERT_PROFILES: dict[str, dict] = {
-    "dev_senior":    {"role":"Développeur Senior","emoji":"💻","family":"informatique","description":"Architecte logiciel, code propre et performance.","specialty":"Architecture logicielle, design patterns, refactoring, bonnes pratiques, performance applicative et revue de code."},
-    "frontend_dev":  {"role":"Développeur Frontend","emoji":"🖥️","family":"informatique","description":"Interfaces web modernes et réactives.","specialty":"React, Vue, Angular, CSS avancé, accessibilité WCAG et optimisation front."},
-    "backend_dev":   {"role":"Développeur Backend","emoji":"🔧","family":"informatique","description":"APIs robustes, bases de données et microservices.","specialty":"APIs REST/GraphQL, microservices, SQL/NoSQL, caching, scalabilité et sécurité backend."},
-    "mobile_dev":    {"role":"Développeur Mobile","emoji":"📱","family":"informatique","description":"Applications iOS, Android et cross-platform.","specialty":"React Native, Flutter, Swift, Kotlin, UX mobile et optimisation des performances."},
-    "data_scientist":{"role":"Data Scientist","emoji":"📊","family":"informatique","description":"Analyse de données, ML et statistiques.","specialty":"Machine learning, statistiques, visualisation et évaluation de modèles."},
-    "ml_engineer":   {"role":"ML Engineer","emoji":"🧠","family":"informatique","description":"Pipelines IA, déploiement et fine-tuning de modèles.","specialty":"MLOps, déploiement, pipelines de données et monitoring de modèles."},
-    "data_engineer": {"role":"Data Engineer","emoji":"🗄️","family":"informatique","description":"ETL, data warehouses et pipelines de données.","specialty":"Spark, Kafka, Airflow, dbt, data lakes et gouvernance des données."},
-    "security_expert":{"role":"Expert Cybersécurité","emoji":"🔒","family":"informatique","description":"Protection des systèmes et gestion des vulnérabilités.","specialty":"Pentest, threat modeling, IAM, cryptographie, cloud security et réponse aux incidents."},
-    "devops":        {"role":"DevOps / Cloud","emoji":"⚙️","family":"informatique","description":"Infrastructure, CI/CD et scalabilité cloud.","specialty":"Docker, Kubernetes, Terraform, CI/CD, observabilité et SRE."},
-    "ux_designer":   {"role":"UX/UI Designer","emoji":"🎨","family":"art","description":"Expérience utilisateur et interfaces intuitives.","specialty":"Research UX, wireframes, prototypage, design systems et accessibilité."},
-    "creative_dir":  {"role":"Directeur Créatif","emoji":"✨","family":"art","description":"Innovation visuelle, branding et storytelling.","specialty":"Direction artistique, identité de marque et stratégie créative."},
-    "graphic_designer":{"role":"Graphiste","emoji":"🖌️","family":"art","description":"Identité visuelle, print et illustration.","specialty":"Branding, illustration, mise en page éditoriale et packaging."},
-    "motion_designer":{"role":"Motion Designer","emoji":"🎬","family":"art","description":"Animations, vidéo et effets visuels.","specialty":"Animation 2D/3D, motion graphics, storyboard et post-production."},
-    "photographer":  {"role":"Directeur Photo","emoji":"📷","family":"art","description":"Composition, lumière et direction artistique.","specialty":"Direction photo, composition, éclairage et post-traitement."},
-    "copywriter":    {"role":"Copywriter","emoji":"✍️","family":"art","description":"Contenu persuasif, storytelling et conversion.","specialty":"Copywriting, content marketing, SEO rédactionnel et UX writing."},
-    "architect":     {"role":"Architecte / Designer Intérieur","emoji":"🏛️","family":"art","description":"Conception spatiale, ergonomie et esthétique.","specialty":"Conception architecturale, design d'intérieur et durabilité."},
-    "product_manager":{"role":"Product Manager","emoji":"🗺️","family":"business","description":"Roadmap produit, priorisation et go-to-market.","specialty":"Vision produit, user stories, OKRs, priorisation et métriques produit."},
-    "business_strat":{"role":"Stratège Business","emoji":"🎯","family":"business","description":"Vision stratégique, business model et croissance.","specialty":"SWOT, business model, analyse concurrentielle et stratégie de croissance."},
-    "marketing":     {"role":"Expert Marketing","emoji":"📣","family":"business","description":"Acquisition, branding et growth hacking.","specialty":"Stratégie digitale, SEO/SEA, growth et analyse d'audience."},
-    "finance":       {"role":"Analyste Finance","emoji":"💰","family":"business","description":"ROI, budgets, rentabilité et levée de fonds.","specialty":"Analyse financière, modélisation, trésorerie et gestion des risques."},
-    "legal":         {"role":"Conseiller Légal","emoji":"⚖️","family":"business","description":"Droit des affaires, contrats et propriété intellectuelle.","specialty":"Contrats, conformité, propriété intellectuelle et protection des données."},
-    "hr_expert":     {"role":"Expert RH & Management","emoji":"👥","family":"business","description":"Recrutement, culture d'entreprise et leadership.","specialty":"Stratégie RH, talents, leadership et conduite du changement."},
-    "entrepreneur":  {"role":"Entrepreneur / Startuper","emoji":"🚀","family":"business","description":"Lean startup, MVP, pivots et traction.","specialty":"Lean startup, validation d'hypothèses, MVP et product-market fit."},
-    "project_manager":{"role":"Chef de Projet","emoji":"📋","family":"business","description":"Planning, ressources et livraison des projets.","specialty":"Agile, gestion des risques, coordination et pilotage des KPIs."},
-    "medecin":       {"role":"Médecin Généraliste","emoji":"🩺","family":"sante","description":"Diagnostics, prévention et santé globale.","specialty":"Prévention, orientation clinique et médecine basée sur les preuves."},
-    "psychologue":   {"role":"Psychologue","emoji":"🧠","family":"sante","description":"Santé mentale, thérapies et bien-être émotionnel.","specialty":"TCC, stress, burn-out et relation d'aide."},
-    "nutritionniste":{"role":"Nutritionniste","emoji":"🥗","family":"sante","description":"Alimentation équilibrée et santé métabolique.","specialty":"Nutrition, micronutrition, troubles alimentaires et performance."},
-    "pharmacien":    {"role":"Pharmacien","emoji":"💊","family":"sante","description":"Médicaments, interactions et protocoles de traitement.","specialty":"Pharmacologie, interactions médicamenteuses et suivi des traitements."},
-    "coach_sportif": {"role":"Coach Sportif / Kinésithérapeute","emoji":"🏋️","family":"sante","description":"Performance physique, entraînement et récupération.","specialty":"Planification d'entraînement, biomécanique et prévention des blessures."},
-    "physicien":     {"role":"Physicien","emoji":"⚛️","family":"sciences","description":"Mécanique, énergie, physique quantique et optique.","specialty":"Physique théorique et appliquée, matériaux et modélisation."},
-    "biologiste":    {"role":"Biologiste","emoji":"🧬","family":"sciences","description":"Génétique, biologie cellulaire et écosystèmes.","specialty":"Biologie moléculaire, microbiologie, biotechnologies et écologie."},
-    "chimiste":      {"role":"Chimiste","emoji":"🧪","family":"sciences","description":"Réactions, matériaux et formulations.","specialty":"Chimie analytique, organique, matériaux et sécurité chimique."},
-    "mathematicien": {"role":"Mathématicien","emoji":"📐","family":"sciences","description":"Modélisation, algorithmes et statistiques avancées.","specialty":"Probabilités, optimisation, algorithmes et cryptographie."},
-    "ingenieur":     {"role":"Ingénieur Généraliste","emoji":"🔩","family":"sciences","description":"Conception mécanique, fabrication et optimisation.","specialty":"Conception, simulation, production et contrôle qualité."},
-    "formateur":     {"role":"Formateur / Pédagogue","emoji":"🎓","family":"education","description":"Conception pédagogique et transmission des savoirs.","specialty":"Ingénierie pédagogique, e-learning et évaluation des apprentissages."},
-    "coach_life":    {"role":"Coach de Vie / Executive Coach","emoji":"🌱","family":"education","description":"Développement personnel, objectifs et mindset.","specialty":"Coaching orienté solution, objectifs SMART et leadership personnel."},
-    "philosophe":    {"role":"Philosophe / Éthicien","emoji":"🦉","family":"education","description":"Éthique, logique et analyse critique.","specialty":"Éthique appliquée, logique argumentative et pensée critique."},
-    "sociologue":    {"role":"Sociologue","emoji":"🌐","family":"societe","description":"Comportements sociaux, tendances et cultures.","specialty":"Analyse sociologique, dynamiques de groupe et tendances culturelles."},
-    "economiste":    {"role":"Économiste","emoji":"📈","family":"societe","description":"Marchés, politiques économiques et analyses macro.","specialty":"Micro, macro, politiques publiques et économétrie."},
-    "expert_rse":    {"role":"Expert RSE / Durabilité","emoji":"♻️","family":"societe","description":"Responsabilité sociale et impact environnemental.","specialty":"Stratégie RSE, bilan carbone, CSRD et transition énergétique."},
-    "journaliste":   {"role":"Journaliste / Analyste","emoji":"📰","family":"societe","description":"Investigation, fact-checking et communication.","specialty":"Fact-checking, investigation, communication de crise et analyse médiatique."},
-}
-
-
-# ===========================================================================
-# WAR ROOM — Sélection experts & pipeline
-# ===========================================================================
-
-def _select_experts(
-        query: str, model: str, lang_rule: str,
-        selected_experts: list[str], num_experts: int = 3,
-) -> tuple[list[dict], str]:
-    num_experts = max(1, min(num_experts, 6))
-    forced = [_normalize_expert_payload(EXPERT_PROFILES[eid])
-              for eid in selected_experts if eid in EXPERT_PROFILES]
-    if len(forced) >= num_experts:
-        experts = forced[:num_experts]
-        return experts, f"Analyse selon les profils sélectionnés : {', '.join(e['role'] for e in experts)}"
-    if 0 < len(forced) < num_experts:
-        local_fillers = [
-            {"role":"Développeur Senior","emoji":"💻","specialty":"Architecture, qualité et complétude du code"},
-            {"role":"Chef de Projet","emoji":"📋","specialty":"Priorisation, risques et exécution rapide"},
-            {"role":"Expert QA","emoji":"✅","specialty":"Tests, robustesse, cas limites et fiabilité"},
-            {"role":"Expert Cybersécurité","emoji":"🔒","specialty":"Sécurité, vulnérabilités et conformité"},
-            {"role":"DevOps / Cloud","emoji":"⚙️","specialty":"Déploiement, CI/CD et observabilité"},
-            {"role":"Stratège Business","emoji":"🎯","specialty":"Vision stratégique et business model"},
-        ]
-        picked_roles = {e["role"] for e in forced}
-        fillers  = [f for f in local_fillers if f["role"] not in picked_roles]
-        experts  = (forced + fillers)[:num_experts]
-        return experts, "Analyse hybride rapide avec experts sélectionnés et compléments locaux"
-    prompt = (
-        f"{lang_rule}\n"
-        f"Tu es un orchestrateur minimaliste. Choisis EXACTEMENT {num_experts} experts utiles.\n"
-        '{"experts": [{"role": "...", "emoji": "...", "specialty": "..."}], "strategy": "..."}\n\n'
-        f"Demande : {query}"
-    )
-    try:
-        ai_data = _parse_json_llm(call_llm_with_retry(
-            [{"role":"user","content":prompt}], model=model,
-            max_tokens=TOKENS_ORCHESTRATOR, step_name="Orchestrateur",
-        ))
-        experts = [_normalize_expert_payload(e) for e in ai_data.get("experts", [])][:num_experts]
-        if len(experts) < num_experts:
-            raise ValueError(f"Pas assez d'experts ({len(experts)}/{num_experts})")
-        return experts, ai_data.get("strategy", "Analyse multi-angle")
-    except Exception as exc:
-        logger.warning("Orchestrateur fallback : %s", exc)
-        fallback = [
-            {"role":"Expert Technique","emoji":"💻","specialty":"Analyse technique et implémentation"},
-            {"role":"Stratège","emoji":"🎯","specialty":"Vision stratégique et risques"},
-            {"role":"Expert QA","emoji":"✅","specialty":"Tests, robustesse et validation"},
-            {"role":"Expert Cybersécurité","emoji":"🔒","specialty":"Sécurité et conformité"},
-            {"role":"DevOps","emoji":"⚙️","specialty":"Déploiement et infrastructure"},
-            {"role":"Product Manager","emoji":"🗺️","specialty":"Vision produit et priorisation"},
-        ]
-        return fallback[:num_experts], "Analyse multi-angle en fallback"
-
-
-def _build_pm_data(query: str, model: str, lang_rule: str) -> tuple[dict, float]:
-    t0 = time.time()
-    pm_prompt = (
-        f"{lang_rule}\nTu es un Chef de Projet Senior. Fournis un cadrage TRÈS CONCIS.\n"
-        "Retourne UNIQUEMENT un JSON valide :\n"
-        '{"project_title":"...","objective":"...","action_plan":[{"step":1,"action":"...","priority":"haute|moyenne|basse"}],"key_risks":["..."],"success_criteria":"..."}\n\n'
-        f"Demande : {query}"
-    )
-    try:
-        result = _parse_json_llm(call_llm_with_retry(
-            [{"role":"user","content":pm_prompt}], model=model,
-            max_tokens=TOKENS_PM, step_name="Chef-de-Projet",
-        ))
-        return result, (time.time() - t0) * 1000
-    except Exception as exc:
-        logger.warning("Chef de projet fallback : %s", exc)
-        return {
-            "project_title": "Analyse en cours", "objective": "Résoudre la demande",
-            "action_plan": [{"step":1,"action":"Cadrer le besoin","priority":"haute"},
-                            {"step":2,"action":"Produire une solution","priority":"haute"}],
-            "key_risks": ["Ambiguïté du besoin"], "success_criteria": "Réponse complète et exploitable",
-        }, (time.time() - t0) * 1000
-
-
-def _call_agent(query: str, model: str, lang_rule: str, expert: dict, idx: int, tokens_agent: int = TOKENS_AGENT) -> dict:
-    query_excerpt   = _safe_excerpt(query, 2_000)
-    effective_tokens = min(tokens_agent, 1_500)
-    agent_prompt = (
-        f"{lang_rule}\nTu es {expert['role']} ({expert['specialty']}).\n"
-        "Analyse COURTE et très actionnable en 4 points (2-3 phrases max chacun) :\n"
-        "1) Diagnostic\n2) Recommandations\n3) Risques\n4) Actions immédiates\n\n"
-        f"Demande : {query_excerpt}"
-    )
-    t0 = time.time()
-    try:
-        response = call_llm_with_retry(
-            [{"role":"user","content":agent_prompt}], model=model,
-            max_tokens=effective_tokens, step_name=f"Expert-{idx}-{expert['role']}",
-        )
-        return {"expert":expert,"proposal":response,"idx":idx,"error":None,
-                "duration_ms":int((time.time()-t0)*1000)}
-    except Exception as exc:
-        logger.warning("Expert %s erreur : %s", expert.get("role"), exc)
-        return {"expert":expert,"proposal":"Analyse indisponible.",
-                "idx":idx,"error":str(exc),"duration_ms":int((time.time()-t0)*1000)}
-
-
-def _run_parallel_experts(query: str, model: str, lang_rule: str, experts: list[dict], tokens_agent: int = TOKENS_AGENT) -> list[dict]:
-    proposals: list[dict | None] = [None] * len(experts)
-    if not experts:
-        return []
-    with ThreadPoolExecutor(max_workers=len(experts)) as executor:
-        futures = {executor.submit(_call_agent, query, model, lang_rule, exp, i, tokens_agent): i
-                   for i, exp in enumerate(experts)}
-        for future, idx in futures.items():
-            expert = experts[idx]
-            try:
-                result = future.result(timeout=EXPERTS_TIMEOUT_SECONDS)
-                proposals[idx] = result
-            except TimeoutError:
-                proposals[idx] = {"expert":expert,"proposal":"Analyse non revenue à temps.",
-                                  "idx":idx,"error":"timeout","duration_ms":EXPERTS_TIMEOUT_SECONDS*1000}
-            except Exception as exc:
-                proposals[idx] = {"expert":expert,"proposal":"Analyse indisponible.",
-                                  "idx":idx,"error":str(exc),"duration_ms":0}
-    return [p for p in proposals if p]
-
-
-def _run_expert_debate(query: str, model: str, lang_rule: str, proposals: list[dict], rounds: int = 1) -> list[dict]:
-    if rounds <= 0 or len(proposals) < 2:
-        return proposals
-    updated = list(proposals)
-    for round_idx in range(1, rounds + 1):
-        others_text_by_idx: dict[int, str] = {}
-        for p in updated:
-            others = [f"--- {o['expert']['emoji']} {o['expert']['role']} ---\n{_safe_excerpt(o['proposal'],2500)}"
-                      for o in updated if o["idx"] != p["idx"]]
-            others_text_by_idx[p["idx"]] = "\n\n".join(others)
-
-        def _debate_one(p: dict) -> dict:
-            debate_prompt = (
-                f"{lang_rule}\nTu es {p['expert']['role']} ({p['expert']['specialty']}).\n"
-                "Tu viens de lire les analyses de tes collègues. Enrichis ou corrige ta position.\n"
-                "Structure :\n1) Points d'accord\n2) Points de désaccord\n3) Position enrichie\n\n"
-                f"DEMANDE : {query}\n\nTA PREMIÈRE ANALYSE :\n{_safe_excerpt(p['proposal'],2000)}\n\n"
-                f"ANALYSES DES AUTRES :\n{others_text_by_idx[p['idx']]}"
-            )
-            try:
-                updated_proposal = call_llm_with_retry(
-                    [{"role":"user","content":debate_prompt}], model=model,
-                    max_tokens=TOKENS_DEBATE, step_name=f"Débat-R{round_idx}-{p['expert']['role']}",
-                )
-                return {**p, "proposal": updated_proposal, "debated": True}
-            except Exception as exc:
-                logger.warning("Débat %s R%d erreur : %s", p["expert"]["role"], round_idx, exc)
-                return {**p, "debated": False}
-
-        with ThreadPoolExecutor(max_workers=len(updated)) as ex:
-            futures_debate = {ex.submit(_debate_one, p): p["idx"] for p in updated}
-            new_updated = list(updated)
-            for fut, idx in futures_debate.items():
-                try:
-                    res = fut.result(timeout=EXPERTS_TIMEOUT_SECONDS)
-                    pos = next(i for i, p in enumerate(new_updated) if p["idx"] == idx)
-                    new_updated[pos] = res
-                except Exception as exc:
-                    logger.warning("Résultat débat idx %d perdu : %s", idx, exc)
-            updated = new_updated
-    return updated
-
-
-def _run_advocate(query: str, synthesis: str, model: str, lang_rule: str) -> str:
-    prompt = (
-        f"{lang_rule}\nTu es l'Avocat du Diable. Analyse la synthèse et identifie les failles.\n"
-        "Structure :\n## Failles critiques\n## Risques majeurs\n## Hypothèses dangereuses\n## Points de vigilance pour le code\n\n"
-        f"DEMANDE ORIGINALE : {query}\n\nSYNTHÈSE :\n{_safe_excerpt(synthesis, 5000)}"
-    )
-    try:
-        return call_llm_with_retry(
-            [{"role":"user","content":prompt}], model=model,
-            max_tokens=TOKENS_ADVOCATE, step_name="Avocat-du-Diable",
-        )
-    except Exception as exc:
-        logger.warning("Avocat du diable erreur : %s", exc)
-        return "Critique indisponible."
-
-
-def _build_synthesis(query: str, pm_data: dict, proposals: list[dict], model: str, lang_rule: str) -> tuple[str, float]:
-    t0 = time.time()
-    proposals_text = "\n\n".join(
-        f"--- {p['expert']['emoji']} {p['expert']['role']} ---\n{_safe_excerpt(p['proposal'],7000)}"
-        for p in proposals
-    )
-    synthesis_prompt = (
-        f"{lang_rule}\nTu es un synthétiseur critique.\n"
-        f"DEMANDE : {query}\n\nCADRAGE PM :\n"
-        f"- Objectif : {pm_data.get('objective','')}\n"
-        f"- Étapes : {', '.join(s.get('action','') for s in pm_data.get('action_plan',[]))}\n"
-        f"- Risques : {', '.join(pm_data.get('key_risks',[]))}\n\n"
-        f"AVIS EXPERTS :\n{proposals_text}\n\n"
-        "Réponds avec :\n1. Diagnostic consolidé\n2. Décisions / arbitrages\n"
-        "3. Plan d'action final priorisé\n4. Risques et mitigations\n5. Inputs minimum pour coder"
-    )
-    try:
-        result = call_llm_with_retry(
-            [{"role":"user","content":synthesis_prompt}], model=model,
-            max_tokens=TOKENS_SYNTHESIS, step_name="Synthèse",
-        )
-        return result, (time.time() - t0) * 1000
-    except Exception as exc:
-        logger.warning("Synthèse fallback : %s", exc)
-        return ("1. Diagnostic consolidé\nBesoin traité.\n\n2. Décisions\nSimplifier.\n\n"
-                "3. Plan d'action\n- Générer le code\n- Valider complétude\n\n"
-                "4. Risques\n- Troncature => continuation\n\n5. Inputs\nStack cible, exemples."), (time.time()-t0)*1000
-
-
-def _build_programmer_prompt(query: str, synthesis: str, lang_rule: str,
-                              advocate_critique: str | None = None, stack: str | None = None) -> str:
-    stack_hint = f"\nSTACK CIBLE : {stack}" if stack else ""
-    advocate_section = (
-        f"\nPOINTS DE VIGILANCE (Avocat du Diable) :\n{_safe_excerpt(advocate_critique, 2000)}\n"
-        if advocate_critique else ""
-    )
-    return (
-        f"{lang_rule}\nTu es un Développeur Expert Senior Full-Stack.\n"
-        f"{stack_hint}\n\nDEMANDE ORIGINALE : {query}\n\nPLAN FINAL :\n{synthesis}\n"
-        f"{advocate_section}\n"
-        "RÈGLES DE SORTIE — ABSOLUMENT OBLIGATOIRES :\n"
-        "1. INTERDIT : toute phrase narrative.\n"
-        "2. Commence DIRECTEMENT par le code ou par `### FILE:`\n"
-        "3. Format multi-fichiers : ### FILE: nom.ext\n   ```lang\n   ...\n   ```\n"
-        "4. Ne coupe jamais une fonction ou un fichier.\n"
-        f"5. Termine impérativement par : {FINAL_CODE_END_MARKER}\n"
-        "6. AUCUN texte après le marqueur final.\n"
-    )
-
-
-def _complete_generation_if_needed(initial_output: str, original_prompt: str, model: str, max_rounds: int = 5) -> str:
-    output = initial_output
-    if not _is_likely_truncated(output):
-        return output
-    logger.info("Génération tronquée — lancement de %d round(s) de continuation.", max_rounds)
-    for round_idx in range(1, max_rounds + 1):
-        continuation_prompt = (
-            "Tu dois TERMINER une génération de code potentiellement tronquée.\n"
-            "Règles :\n1) Ne répète JAMAIS le début déjà généré.\n"
-            "2) Reprends EXACTEMENT à partir de la dernière ligne utile.\n"
-            "3) Ferme tous les blocs ouverts.\n"
-            f"4) Termine par : {FINAL_CODE_END_MARKER}\n"
-            f"DEMANDE : {original_prompt[:3_000]}\n\nSORTIE DÉJÀ GÉNÉRÉE (fin) :\n{output[-30_000:]}\n\n"
-            "Donne UNIQUEMENT la suite manquante."
-        )
-        try:
-            suffix = call_llm_with_retry(
-                [{"role":"user","content":continuation_prompt}], model=model,
-                max_tokens=TOKENS_CONTINUATION, step_name=f"Continuation-{round_idx}",
-            )
-            output = output.rstrip() + "\n" + suffix.lstrip()
-            if not _is_likely_truncated(output):
-                logger.info("Continuation terminée au round %d.", round_idx)
-                return output
-        except Exception as exc:
-            logger.warning("Continuation round %d erreur : %s", round_idx, exc)
-            continue
-    return output
-
-
-def _run_code_review(query: str, programmer_output: str, model: str, lang_rule: str) -> tuple[str, list[dict]]:
-    review_prompt = (
-        f"{lang_rule}\nTu es un Expert Reviewer de code Senior.\n"
-        "Si tout est correct : LGTM\n"
-        'Sinon : {"corrections": [{"file": "...", "line_hint": "...", "issue": "...", "fix": "..."}], "summary": "..."}\n\n'
-        f"DEMANDE : {query}\n\nCODE :\n{_safe_excerpt(programmer_output, 30000)}"
-    )
-    try:
-        raw = call_llm_with_retry(
-            [{"role":"user","content":review_prompt}], model=model,
-            max_tokens=TOKENS_REVIEWER, step_name="Code-Reviewer",
-        )
-        if "LGTM" in raw.upper() and "{" not in raw:
-            return raw, []
-        data = _parse_json_llm(raw)
-        return data.get("summary", raw), data.get("corrections", [])
-    except Exception as exc:
-        logger.warning("Code reviewer erreur : %s", exc)
-        return "Review indisponible.", []
-
-
-def _apply_corrections_if_needed(programmer_output: str, corrections: list[dict], query: str,
-                                  synthesis: str, model: str, lang_rule: str,
-                                  advocate_critique: str | None, stack: str | None) -> str:
-    if not corrections:
-        return programmer_output
-    corrections_text = "\n".join(
-        f"- [{c.get('file','?')}] {c.get('issue','')} => {c.get('fix','')}" for c in corrections
-    )
-    corrected_prompt = (
-        _build_programmer_prompt(query, synthesis, lang_rule, advocate_critique, stack)
-        + f"\n\nCORRECTIONS DU REVIEWER :\n{corrections_text}\nApplique TOUTES ces corrections."
-    )
-    try:
-        corrected = call_llm_with_retry(
-            [{"role":"user","content":corrected_prompt}], model=model,
-            max_tokens=TOKENS_PROGRAMMER, step_name="Programmeur-post-review",
-        )
-        return _complete_generation_if_needed(corrected, corrected_prompt, model=model)
-    except Exception as exc:
-        logger.warning("Programmeur post-review erreur : %s", exc)
-        return programmer_output
-
-
-def _generate_tests(query: str, files: list[dict], model: str, lang_rule: str) -> str:
-    if not files:
-        return ""
-    code_context = "\n\n".join(
-        f"### FILE: {f['filename']}\n```{f['language']}\n{_safe_excerpt(f['content'],6000)}\n```"
-        for f in files
-    )
-    test_prompt = (
-        f"{lang_rule}\nTu es un Expert QA Senior. Génère des tests unitaires complets.\n"
-        "- Utilise le framework de test standard du langage.\n"
-        "- Couvre cas nominaux, limites, erreurs.\n"
-        f"- Commence par `### FILE: test_xxx.ext` — zéro introduction.\n"
-        f"- Termine par : {FINAL_CODE_END_MARKER}\n\n"
-        f"DEMANDE : {query}\n\nCODE :\n{code_context}"
-    )
-    try:
-        return call_llm_with_retry(
-            [{"role":"user","content":test_prompt}], model=model,
-            max_tokens=TOKENS_TESTS, step_name="Génération-Tests",
-        )
-    except Exception as exc:
-        logger.warning("Génération tests erreur : %s", exc)
-        return ""
-
-
-def _build_executive_summary(query: str, synthesis: str, programmer_output: str, model: str, lang_rule: str) -> str:
-    prompt = (
-        f"{lang_rule}\nTu es un assistant de direction. Rédige un résumé exécutif en 3 points max.\n"
-        "Niveau manager : sans jargon, orienté résultat. Format : 3 bullet points courts.\n\n"
-        f"DEMANDE : {query}\n\nSYNTHÈSE : {_safe_excerpt(synthesis, 2000)}"
-    )
-    try:
-        return call_llm_with_retry(
-            [{"role":"user","content":prompt}], model=model,
-            max_tokens=TOKENS_SUMMARY, step_name="Résumé-Exécutif",
-        )
-    except Exception as exc:
-        logger.warning("Résumé exécutif erreur : %s", exc)
-        return ""
-
-
-def _run_pipeline(params: dict) -> dict:
-    timings: dict[str, float] = {}
-    started_at = time.time()
-    query          = params["query"]
-    model          = params["model"]
-    lang_rule      = params["lang_rule"]
-    num_experts    = params["num_experts"]
-    selected_experts = params["selected_experts"]
-    debate_rounds  = params["debate_rounds"]
-    advocate_enabled = params["advocate"]
-    reviewer_enabled = params["reviewer"]
-    generate_tests = params["generate_tests"]
-    exec_summary   = params["executive_summary"]
-    tokens_agent   = params["tokens_agent"]
-    tokens_programmer = params["tokens_programmer"]
-    stack          = params["stack"]
-    session_id     = params.get("session_id")
-
-    session_context = ""
-    if session_id and session_id in _session_store and _session_store[session_id]:
-        prev = _session_store[session_id][-1]
-        session_context = (
-            f"\nCONTEXTE SESSION PRÉCÉDENTE :\n"
-            f"- Demande précédente : {prev.get('query','')[:300]}\n"
-            f"- Synthèse résumée : {_safe_excerpt(prev.get('synthesis',''), 800)}\n"
-        )
-    query_with_context = query + session_context if session_context else query
-
-    pm_data, timings["pm_ms"] = _build_pm_data(query_with_context, model, lang_rule)
-    t0 = time.time()
-    experts, strategy = _select_experts(query_with_context, model, lang_rule, selected_experts, num_experts)
-    timings["orchestrator_ms"] = (time.time() - t0) * 1000
-    t0 = time.time()
-    proposals = _run_parallel_experts(query_with_context, model, lang_rule, experts, tokens_agent)
-    timings["experts_ms"] = (time.time() - t0) * 1000
-    if debate_rounds > 0:
-        t0 = time.time()
-        proposals = _run_expert_debate(query_with_context, model, lang_rule, proposals, debate_rounds)
-        timings["debate_ms"] = (time.time() - t0) * 1000
-    synthesis, timings["synthesis_ms"] = _build_synthesis(query_with_context, pm_data, proposals, model, lang_rule)
-    advocate_critique: str | None = None
-    if advocate_enabled:
-        t0 = time.time()
-        advocate_critique = _run_advocate(query, synthesis, model, lang_rule)
-        timings["advocate_ms"] = (time.time() - t0) * 1000
-    programmer_prompt = _build_programmer_prompt(query, synthesis, lang_rule, advocate_critique, stack)
-    t0 = time.time()
-    try:
-        programmer_output = call_llm_with_retry(
-            [{"role":"user","content":programmer_prompt}], model=model,
-            max_tokens=tokens_programmer, step_name="Programmeur",
-        )
-        programmer_output = _complete_generation_if_needed(programmer_output, programmer_prompt, model=model)
-    except Exception as exc:
-        programmer_output = f"Erreur lors de la génération du code : {exc}"
-    timings["programmer_ms"] = (time.time() - t0) * 1000
-    review_text = ""
-    corrections  = []
-    if reviewer_enabled:
-        t0 = time.time()
-        review_text, corrections = _run_code_review(query, programmer_output, model, lang_rule)
-        timings["reviewer_ms"] = (time.time() - t0) * 1000
-        if corrections:
-            t0 = time.time()
-            programmer_output = _apply_corrections_if_needed(
-                programmer_output, corrections, query, synthesis, model, lang_rule, advocate_critique, stack)
-            timings["programmer_post_review_ms"] = (time.time() - t0) * 1000
-    files       = _extract_files(programmer_output)
-    clean_output = _clean_programmer_output(programmer_output)
-    tests_output  = ""
-    test_files: list[dict] = []
-    if generate_tests and files:
-        t0 = time.time()
-        tests_output = _generate_tests(query, files, model, lang_rule)
-        test_files   = _extract_files(tests_output)
-        timings["tests_ms"] = (time.time() - t0) * 1000
-    executive_summary_text = ""
-    if exec_summary:
-        t0 = time.time()
-        executive_summary_text = _build_executive_summary(query, synthesis, programmer_output, model, lang_rule)
-        timings["executive_summary_ms"] = (time.time() - t0) * 1000
-    complete       = FINAL_CODE_END_MARKER in programmer_output
-    total_chars    = sum(len(f["content"]) for f in files)
-    experts_ok     = sum(1 for p in proposals if not p.get("error"))
-    quality_score  = round(
-        (0.4*(1 if complete else 0)) + (0.3*experts_ok/max(len(proposals),1)) + (0.3*(1 if files else 0)), 2)
-    timings["total_ms"] = int((time.time() - started_at) * 1000)
-    result = {
-        "pm": pm_data, "strategy": strategy, "experts": experts,
-        "proposals": [{"expert":p["expert"],"text":p["proposal"],"error":p.get("error"),
-                       "debated":p.get("debated",False),"duration_ms":p.get("duration_ms",0)} for p in proposals],
-        "synthesis": synthesis, "advocate_critique": advocate_critique,
-        "programmer_output": clean_output, "files": files,
-        "review_comments": review_text, "review_corrections": corrections,
-        "tests_output": _clean_programmer_output(tests_output) if tests_output else "",
-        "test_files": test_files, "executive_summary": executive_summary_text,
-        "meta": {
-            "query": query, "model": model, "stack_detected": stack,
-            "num_experts": len(experts), "debate_rounds": debate_rounds,
-            "advocate_enabled": advocate_enabled, "reviewer_enabled": reviewer_enabled,
-            "tests_generated": bool(test_files), "programmer_complete": complete,
-            "total_files": len(files), "total_code_chars": total_chars,
-            "quality_score": quality_score, "timings_ms": {k: int(v) for k, v in timings.items()},
-        },
-    }
-    if session_id:
-        if session_id not in _session_store:
-            _session_store[session_id] = []
-        _session_store[session_id].append({"query":query,"synthesis":synthesis,"timestamp":time.time()})
-        _session_store[session_id] = _session_store[session_id][-10:]
-    return result
-
-
-def _parse_warroom_payload(data: dict) -> tuple[dict | None, str | None]:
-    query = data.get("query", "").strip()
-    if not query:
-        return None, "Requête vide"
-    if len(query) > MAX_QUERY_LENGTH:
-        return None, f"Requête trop longue (max {MAX_QUERY_LENGTH} caractères)"
-    model = data.get("model", DEFAULT_MODEL)
-    if model not in ALLOWED_MODELS:
-        model = DEFAULT_MODEL
-    lang      = data.get("lang", "fr")
-    lang_rule = LANG_RULES_SHORT.get(lang, LANG_RULES_SHORT["fr"])
-    selected_experts_raw = data.get("selected_experts", [])
-    if not isinstance(selected_experts_raw, list):
-        selected_experts_raw = []
-    selected_experts = [e for e in selected_experts_raw if e in EXPERT_PROFILES]
-    mode   = data.get("mode", "balanced")
-    preset = MODE_PRESETS.get(mode, MODE_PRESETS["balanced"])
-    params: dict = {
-        "query": query, "model": model, "lang_rule": lang_rule,
-        "selected_experts": selected_experts,
-        "num_experts":      int(data.get("num_experts",      preset["num_experts"])),
-        "debate_rounds":    int(data.get("debate_rounds",    preset["debate_rounds"])),
-        "advocate":        bool(data.get("advocate",         preset["advocate"])),
-        "reviewer":        bool(data.get("reviewer",         preset["reviewer"])),
-        "generate_tests":  bool(data.get("generate_tests",   preset["generate_tests"])),
-        "executive_summary":bool(data.get("executive_summary",preset["executive_summary"])),
-        "tokens_agent":     int(data.get("tokens_agent",     preset["tokens_agent"])),
-        "tokens_programmer":int(data.get("tokens_programmer",preset["tokens_programmer"])),
-        "stack":   _detect_stack(query, data.get("stack")),
-        "session_id":  data.get("session_id"),
-        "webhook_url": data.get("webhook_url"),
-    }
-    params["num_experts"] = max(1, min(params["num_experts"], 6))
-    return params, None
-
-
-# ===========================================================================
-# BLUEPRINTS
-# ===========================================================================
-
-auth_bp    = Blueprint("auth",    __name__)
-chat_bp    = Blueprint("chat",    __name__)
-warroom_bp = Blueprint("warroom", __name__)
-
-# ── AUTH ────────────────────────────────────────────────────────────────────
-
-@auth_bp.route("/login")
-def login_page():
-    if flask_session.get("username"):
-        return redirect("/")
-    return render_template_string(LOGIN_TEMPLATE)
-
-
-@auth_bp.route("/api/auth/register", methods=["POST"])
-def register():
-    data     = request.get_json(force=True)
-    username = data.get("username", "").strip().lower()
-    password = data.get("password", "").strip()
-    email    = data.get("email",    "").strip()
-    if not username or not password:
-        return jsonify({"error": "Nom d'utilisateur et mot de passe requis"}), 400
-    if len(username) < 3:
-        return jsonify({"error": "Le nom d'utilisateur doit faire au moins 3 caractères"}), 400
-    if len(password) < 6:
-        return jsonify({"error": "Le mot de passe doit faire au moins 6 caractères"}), 400
-    with closing(get_db()) as db:
-        if db.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
-            return jsonify({"error": "Ce nom d'utilisateur est déjà pris"}), 409
-        db.execute(
-            "INSERT INTO users (username, password_hash, email, created_at) VALUES (?, ?, ?, ?)",
-            (username, generate_password_hash(password), email, time.strftime("%Y-%m-%d %H:%M:%S")),
-        )
-        db.commit()
-    flask_session["username"] = username
-    logger.info("New user registered: %s", username)
-    return jsonify({"ok": True, "username": username})
-
-
-@auth_bp.route("/api/auth/login", methods=["POST"])
-def login():
-    data     = request.get_json(force=True)
-    username = data.get("username", "").strip().lower()
-    password = data.get("password", "").strip()
-    if not username or not password:
-        return jsonify({"error": "Identifiants manquants"}), 400
-    with closing(get_db()) as db:
-        row = db.execute("SELECT password_hash FROM users WHERE username = ?", (username,)).fetchone()
-    if not row or not check_password_hash(row["password_hash"], password):
-        return jsonify({"error": "Identifiants incorrects"}), 401
-    flask_session["username"] = username
-    logger.info("User logged in: %s", username)
-    return jsonify({"ok": True, "username": username})
-
-
-@auth_bp.route("/api/auth/logout", methods=["POST"])
-def logout():
-    flask_session.clear()
-    return jsonify({"ok": True})
-
-
-@auth_bp.route("/api/auth/me", methods=["GET"])
-def me():
-    username = flask_session.get("username")
-    if not username:
-        return jsonify({"logged_in": False})
-    with closing(get_db()) as db:
-        row = db.execute(
-            "SELECT username, email, created_at FROM users WHERE username = ?", (username,)
-        ).fetchone()
-    if not row:
-        flask_session.clear()
-        return jsonify({"logged_in": False})
-    return jsonify({
-        "logged_in":  True,
-        "username":   row["username"],
-        "email":      row["email"]      or "",
-        "created_at": row["created_at"] or "",
-    })
-
-
-# ── CHAT ────────────────────────────────────────────────────────────────────
-
-@chat_bp.route("/")
-def index() -> str:
-    return render_template_string(
-        _load_html_template(), models=FREE_MODELS, default_model=DEFAULT_MODEL
-    )
-
-
-@chat_bp.route("/api/context", methods=["POST"])
-def set_context():
-    data     = request.get_json(force=True)
-    username = flask_session.get("username", "__anon__")
-    sess     = get_session()
-    if "system_prompt" in data:
-        sess["system_prompt"] = data["system_prompt"].strip()
-    if "model" in data:
-        sess["model"] = data["model"]
-    if "skills" in data:
-        sess["skills"] = [s for s in data["skills"] if isinstance(s, str)]
-    if "lang" in data:
-        sess["lang"] = data["lang"]
-    if username != "__anon__":
-        save_session_to_db(username, sess)
-    return jsonify({"ok": True})
-
-
-@chat_bp.route("/api/skills", methods=["POST"])
-def set_skills():
-    data     = request.get_json(force=True)
-    username = flask_session.get("username", "__anon__")
-    sess     = get_session()
-    sess["skills"] = [s for s in data.get("skills", []) if isinstance(s, str)]
-    if username != "__anon__":
-        save_session_to_db(username, sess)
-    return jsonify({"ok": True, "skills": sess["skills"]})
-
-
-@chat_bp.route("/api/chat", methods=["POST"])
-def chat():
-    username = flask_session.get("username", "__anon__")
-    sess     = get_session()
-    if request.is_json:
-        data     = request.get_json()
-        user_msg = data.get("message", "").strip()
-    else:
-        data     = None
-        user_msg = request.form.get("message", "").strip()
-    file_parts: list[str] = []
-    for f in request.files.getlist("files"):
-        if f.filename:
-            try:
-                content = f.read().decode("utf-8", errors="replace")
-                file_parts.append(f"--- Fichier joint : {f.filename} ---\n{content}")
-            except Exception as exc:
-                logger.warning("Erreur lecture fichier %s : %s", f.filename, exc)
-    full_msg = user_msg
-    if file_parts:
-        full_msg += "\n\n" + "\n\n".join(file_parts)
-    if not full_msg:
-        return jsonify({"error": "Message vide"}), 400
-    lang = (data.get("lang") if data else None) or request.form.get("lang")
-    if lang:
-        sess["lang"] = lang
-        if username != "__anon__":
-            save_session_to_db(username, sess)
-    selected_lang = sess.get("lang", "fr")
-    lang_rule     = LANG_INSTRUCTIONS.get(selected_lang, LANG_INSTRUCTIONS["fr"])
-    sys_content   = build_system_content(sess)
-    tool_block    = (
-        "\n\nOUTILS DISPONIBLES:\n"
-        "Tu as accès à un outil de recherche internet. Pour l'utiliser, "
-        "tape exactement: \\recherche <ta question>\n"
-        "Utilise cet outil pour les questions factuelles ou à jour."
-    )
-    lang_block    = f"\n\nRÈGLE ABSOLUE DE LANGUE: {lang_rule}"
-    full_sys      = (sys_content + tool_block + lang_block) if sys_content else (tool_block.strip() + lang_block)
-    sess["messages"].append({"role": "user", "content": full_msg})
-    payload_messages = [{"role": "system", "content": full_sys}]
-    payload_messages.extend(sess["messages"])
-    max_search_attempts = 5
-    search_count        = 0
-    final_reply         = None
-    while search_count < max_search_attempts:
-        payload = {"model": sess["model"], "messages": payload_messages, "max_tokens": 80000}
-        try:
-            response = http_requests.post(OPENROUTER_URL, headers=_get_headers(), json=payload, timeout=90)
-            result   = response.json()
-        except http_requests.RequestException as exc:
-            logger.error("OpenRouter error: %s", exc)
-            sess["messages"].pop()
-            return jsonify({"error": "Problème de connexion au service AI"}), 502
-        if "error" in result:
-            err = result["error"]
-            sess["messages"].pop()
-            return jsonify({"error": f"IA indisponible ({err.get('code','?')}): {err.get('message','')}"}), 502
-        reply: str = result["choices"][0]["message"]["content"]
-        if reply.strip().startswith("\\recherche "):
-            search_count += 1
-            query = reply.strip()[len("\\recherche "):].strip()
-            if not query:
-                final_reply = reply
-                payload_messages.append({"role": "assistant", "content": reply})
-                break
-            search_results = perform_search(query)
-            payload_messages.append({"role": "assistant", "content": reply})
-            payload_messages.append({
-                "role": "system",
-                "content": (f"RÉSULTATS DE RECHERCHE pour « {query} »:\n{search_results}\n\n"
-                            "Rédige maintenant ta réponse finale basée sur ces résultats."),
-            })
-        else:
-            final_reply = reply
-            payload_messages.append({"role": "assistant", "content": reply})
-            break
-    if final_reply is None:
-        return jsonify({"reply": "Limite de recherches atteinte. Réessaie."})
-    sess["messages"] = [m for m in payload_messages if m["role"] in ("user", "assistant")]
-    if username != "__anon__":
-        save_session_to_db(username, sess)
-    return jsonify({
-        "reply":            final_reply,
-        "total_messages":   len(sess["messages"]),
-        "estimated_tokens": estimate_tokens(sess["messages"]),
-    })
-
-
-@chat_bp.route("/api/clear", methods=["POST"])
-def clear():
-    username = flask_session.get("username", "__anon__")
-    sess     = get_session()
-    sess["messages"] = []
-    if username != "__anon__":
-        save_session_to_db(username, sess)
-    return jsonify({"ok": True})
-
-
-@chat_bp.route("/api/history", methods=["GET"])
-def history():
-    sess = get_session()
-    return jsonify({
-        "messages":         sess["messages"],
-        "system_prompt":    sess["system_prompt"],
-        "model":            sess["model"],
-        "skills":           sess.get("skills", []),
-        "lang":             sess.get("lang", "fr"),
-        "estimated_tokens": estimate_tokens(sess["messages"]),
-    })
-
-
-# ── WAR ROOM ────────────────────────────────────────────────────────────────
-
-@warroom_bp.route("/api/warroom", methods=["POST"])
-def warroom():
-    ip = request.remote_addr or "unknown"
-    if not _rate_check(ip):
-        return jsonify({"error": "Rate limit dépassé."}), 429
-    data = request.get_json(force=True, silent=True) or {}
-    params, err = _parse_warroom_payload(data)
-    if err:
-        return jsonify({"error": err}), 400
-    cache_key = _cache_key(params["query"], params["model"], params["selected_experts"])
-    cached    = _cache_get(cache_key)
-    if cached and not data.get("no_cache"):
-        cached["meta"]["cache_hit"] = True
-        return jsonify(cached)
-    if params.get("webhook_url"):
-        job_id = str(uuid.uuid4())
-        _job_store[job_id] = {"status": "pending", "result": None, "created_at": time.time()}
-        def _async_run():
-            try:
-                result = _run_pipeline(params)
-                _job_store[job_id]["status"] = "done"
-                _job_store[job_id]["result"] = result
-                _cache_set(cache_key, result)
-                try:
-                    http_requests.post(params["webhook_url"], json={"job_id":job_id,"result":result}, timeout=15)
-                except Exception as exc:
-                    logger.warning("Webhook delivery failed : %s", exc)
-            except Exception as exc:
-                _job_store[job_id]["status"] = "error"
-                _job_store[job_id]["error"]  = str(exc)
-        threading.Thread(target=_async_run, daemon=True).start()
-        return jsonify({"job_id": job_id, "status": "pending"}), 202
-    result = _run_pipeline(params)
-    result["meta"]["cache_hit"] = False
-    _cache_set(cache_key, result)
-    return jsonify(result)
-
-
-@warroom_bp.route("/api/warroom/stream", methods=["POST"])
-def warroom_stream():
-    ip = request.remote_addr or "unknown"
-    if not _rate_check(ip):
-        def _err():
-            yield "data: " + json.dumps({"event":"error","message":"Rate limit dépassé."}) + "\n\n"
-        return Response(stream_with_context(_err()), mimetype="text/event-stream")
-    data = request.get_json(force=True, silent=True) or {}
-    params, err = _parse_warroom_payload(data)
-    if err:
-        def _err():
-            yield "data: " + json.dumps({"event":"error","message":err}) + "\n\n"
-        return Response(stream_with_context(_err()), mimetype="text/event-stream")
-
-    def _sse(event: str, payload: dict) -> str:
-        return "data: " + json.dumps({"event": event, **payload}) + "\n\n"
-
-    @stream_with_context
-    def _generate() -> Generator[str, None, None]:
-        query     = params["query"]
-        model     = params["model"]
-        lang_rule = params["lang_rule"]
-        stack     = params["stack"]
-        pm_data, _ = _build_pm_data(query, model, lang_rule)
-        yield _sse("pm_ready", {"pm": pm_data})
-        experts, strategy = _select_experts(query, model, lang_rule, params["selected_experts"], params["num_experts"])
-        proposals = _run_parallel_experts(query, model, lang_rule, experts, params["tokens_agent"])
-        yield _sse("experts_ready", {
-            "experts": experts, "strategy": strategy,
-            "proposals": [{"expert":p["expert"],"text":p["proposal"],"error":p.get("error")} for p in proposals],
-        })
-        if params["debate_rounds"] > 0:
-            proposals = _run_expert_debate(query, model, lang_rule, proposals, params["debate_rounds"])
-            yield _sse("debate_ready", {
-                "proposals": [{"expert":p["expert"],"text":p["proposal"]} for p in proposals],
-            })
-        synthesis, _ = _build_synthesis(query, pm_data, proposals, model, lang_rule)
-        yield _sse("synthesis_ready", {"synthesis": synthesis})
-        advocate_critique = None
-        if params["advocate"]:
-            advocate_critique = _run_advocate(query, synthesis, model, lang_rule)
-            yield _sse("advocate_ready", {"advocate_critique": advocate_critique})
-        programmer_prompt = _build_programmer_prompt(query, synthesis, lang_rule, advocate_critique, stack)
-        try:
-            programmer_output = call_llm_with_retry(
-                [{"role":"user","content":programmer_prompt}], model=model,
-                max_tokens=params["tokens_programmer"], step_name="Programmeur-stream",
-            )
-            programmer_output = _complete_generation_if_needed(programmer_output, programmer_prompt, model=model)
-        except Exception as exc:
-            programmer_output = f"Erreur : {exc}"
-        files = _extract_files(programmer_output)
-        yield _sse("code_ready", {
-            "programmer_output": _clean_programmer_output(programmer_output),
-            "files": files,
-            "complete": FINAL_CODE_END_MARKER in programmer_output,
-        })
-        review_text = ""
-        if params["reviewer"]:
-            review_text, corrections = _run_code_review(query, programmer_output, model, lang_rule)
-            if corrections:
-                programmer_output = _apply_corrections_if_needed(
-                    programmer_output, corrections, query, synthesis, model, lang_rule, advocate_critique, stack)
-                files = _extract_files(programmer_output)
-            yield _sse("review_ready", {
-                "review_comments": review_text,
-                "programmer_output": _clean_programmer_output(programmer_output),
-                "files": files,
-            })
-        tests_output = ""
-        if params["generate_tests"] and files:
-            tests_output = _generate_tests(query, files, model, lang_rule)
-            yield _sse("tests_ready", {
-                "tests_output": _clean_programmer_output(tests_output),
-                "test_files":   _extract_files(tests_output),
-            })
-        exec_sum = ""
-        if params["executive_summary"]:
-            exec_sum = _build_executive_summary(query, synthesis, programmer_output, model, lang_rule)
-        yield _sse("done", {
-            "executive_summary": exec_sum,
-            "stack_detected":    stack,
-            "complete":          FINAL_CODE_END_MARKER in programmer_output,
-        })
-
-    return Response(_generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-
-@warroom_bp.route("/api/warroom/refine", methods=["POST"])
-def warroom_refine():
-    ip = request.remote_addr or "unknown"
-    if not _rate_check(ip):
-        return jsonify({"error": "Rate limit dépassé."}), 429
-    data        = request.get_json(force=True, silent=True) or {}
-    refinement  = data.get("refinement", "").strip()
-    synthesis   = data.get("synthesis",  "").strip()
-    query       = data.get("query",      "").strip()
-    model       = data.get("model",      DEFAULT_MODEL)
-    lang        = data.get("lang",       "fr")
-    if not refinement or not synthesis or not query:
-        return jsonify({"error": "Champs requis : query, synthesis, refinement"}), 400
-    if model not in ALLOWED_MODELS:
-        model = DEFAULT_MODEL
-    lang_rule = LANG_RULES_SHORT.get(lang, LANG_RULES_SHORT["fr"])
-    stack     = _detect_stack(query, data.get("stack"))
-    refined_synthesis = synthesis + f"\n\nCONSIGNE DE RAFFINAGE :\n{refinement}"
-    programmer_prompt = _build_programmer_prompt(query, refined_synthesis, lang_rule, stack=stack)
-    t0 = time.time()
-    try:
-        programmer_output = call_llm_with_retry(
-            [{"role":"user","content":programmer_prompt}], model=model,
-            max_tokens=int(data.get("tokens_programmer", TOKENS_PROGRAMMER)),
-            step_name="Programmeur-refine",
-        )
-        programmer_output = _complete_generation_if_needed(programmer_output, programmer_prompt, model=model)
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 502
-    files = _extract_files(programmer_output)
-    return jsonify({
-        "programmer_output": _clean_programmer_output(programmer_output),
-        "files":    files,
-        "complete": FINAL_CODE_END_MARKER in programmer_output,
-        "meta": {
-            "refinement":   refinement,
-            "duration_ms":  int((time.time() - t0) * 1000),
-            "total_files":  len(files),
-        },
-    })
-
-
-@warroom_bp.route("/api/warroom/jobs/<job_id>", methods=["GET"])
-def get_job(job_id: str):
-    job = _job_store.get(job_id)
-    if not job:
-        return jsonify({"error": "Job introuvable"}), 404
-    response = {"job_id": job_id, "status": job["status"], "created_at": job["created_at"]}
-    if job["status"] == "done":
-        response["result"] = job["result"]
-    elif job["status"] == "error":
-        response["error"] = job.get("error", "Erreur inconnue")
-    return jsonify(response)
-
-
-@warroom_bp.route("/api/warroom/sessions/<session_id>", methods=["GET"])
-def get_session_history(session_id: str):
-    history = _session_store.get(session_id, [])
-    return jsonify({"session_id": session_id, "count": len(history), "history": history})
-
-
-@warroom_bp.route("/api/warroom/cache", methods=["DELETE"])
-def clear_cache():
-    count = len(_cache_store)
-    _cache_store.clear()
-    return jsonify({"cleared": count})
-
-
-@warroom_bp.route("/api/experts", methods=["GET"])
-def get_experts_route():
-    return jsonify({
-        "families": EXPERT_FAMILIES,
-        "experts":  {k: {**v} for k, v in EXPERT_PROFILES.items()},
-        "modes":    list(MODE_PRESETS.keys()),
-    })
-
-
-@warroom_bp.route("/api/advocate", methods=["POST"])
-def advocate():
-    ip = request.remote_addr or "unknown"
-    if not _rate_check(ip):
-        return jsonify({"error": "Rate limit dépassé."}), 429
-    data  = request.get_json(force=True, silent=True) or {}
-    topic = data.get("topic", "").strip()
-    model = data.get("model", DEFAULT_MODEL)
-    if not topic:
-        return jsonify({"error": "Sujet vide"}), 400
-    if len(topic) > MAX_QUERY_LENGTH:
-        return jsonify({"error": f"Sujet trop long (max {MAX_QUERY_LENGTH} caractères)"}), 400
-    if model not in ALLOWED_MODELS:
-        model = DEFAULT_MODEL
-    prompt = (
-        "Tu es l'Avocat du Diable. Donne une critique structurée, concrète et concise.\n"
-        "Structure :\n## Failles critiques\n## Risques majeurs\n## Points faibles\n"
-        "## Hypothèses dangereuses\n## Scénarios catastrophe\n## Mitigations\n\n"
-        f"Sujet : {topic}"
-    )
-    try:
-        result = call_llm_with_retry(
-            [{"role":"user","content":prompt}], model=model,
-            max_tokens=3_000, step_name="Avocat-du-Diable",
-        )
-        return jsonify({"critique": result})
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 502
-
-
-@warroom_bp.route("/api/warroom/feedback", methods=["POST"])
-def submit_feedback():
-    data    = request.get_json(force=True, silent=True) or {}
-    score   = data.get("score")
-    comment = data.get("comment", "")
-    query   = data.get("query",   "")
-    if score is None or not isinstance(score, (int, float)) or not (1 <= score <= 5):
-        return jsonify({"error": "score requis entre 1 et 5"}), 400
-    entry = {
-        "score":     float(score),
-        "comment":   str(comment)[:1000],
-        "query":     str(query)[:500],
-        "timestamp": time.time(),
-        "ip":        request.remote_addr,
-    }
-    _feedback_store.append(entry)
-    avg = sum(f["score"] for f in _feedback_store) / len(_feedback_store)
-    return jsonify({"recorded": True, "avg_score": round(avg, 2), "total": len(_feedback_store)})
-
-
-@warroom_bp.route("/api/warroom/feedback", methods=["GET"])
-def get_feedback():
-    if not _feedback_store:
-        return jsonify({"avg_score": None, "total": 0, "recent": []})
-    avg = sum(f["score"] for f in _feedback_store) / len(_feedback_store)
-    return jsonify({"avg_score": round(avg, 2), "total": len(_feedback_store), "recent": _feedback_store[-10:]})
-
-
-# ===========================================================================
-# IDE PYTHON — Exécution sécurisée de code
-# ===========================================================================
-
-import subprocess
-import sys
-import tempfile
-
-ide_bp = Blueprint("ide", __name__)
-
-IDE_TIMEOUT_SECONDS = 15
-IDE_MAX_CODE_LENGTH = 50_000
-IDE_MAX_OUTPUT_LENGTH = 20_000
-
-_IDE_BLOCKED_IMPORTS = [
-    "os.system", "subprocess", "shutil.rmtree", "__import__('os').system",
-    "eval(", "exec(", "open('/etc", "open('/proc", "open('/sys",
-]
-
-
-def _code_is_safe(code: str) -> tuple[bool, str]:
-    """Vérifie basiquement que le code n'est pas dangereux."""
-    lower = code.lower()
-    danger_patterns = [
-        ("import subprocess", "subprocess non autorisé"),
-        ("import shutil", "shutil non autorisé (rm)"),
-        ("os.system(", "os.system non autorisé"),
-        ("os.popen(", "os.popen non autorisé"),
-        ("__import__('os')", "__import__ os non autorisé"),
-        ("open('/etc", "accès /etc non autorisé"),
-        ("open('/proc", "accès /proc non autorisé"),
-    ]
-    for pattern, msg in danger_patterns:
-        if pattern.lower() in lower:
-            return False, msg
-    return True, ""
-
-
-@ide_bp.route("/api/execute", methods=["POST"])
-def execute_code():
-    """Exécute du code Python dans un subprocess isolé avec timeout."""
-    data = request.get_json(force=True, silent=True) or {}
-    code = data.get("code", "").strip()
-    if not code:
-        return jsonify({"error": "Code vide"}), 400
-    if len(code) > IDE_MAX_CODE_LENGTH:
-        return jsonify({"error": f"Code trop long (max {IDE_MAX_CODE_LENGTH} chars)"}), 400
-
-    safe, reason = _code_is_safe(code)
-    if not safe:
-        return jsonify({"error": f"Code non autorisé : {reason}"}), 403
-
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", encoding="utf-8", delete=False) as tmp:
-            tmp.write(code)
-            tmp_path = tmp.name
-
-        t0 = time.time()
-        proc = subprocess.run(
-            [sys.executable, tmp_path],
-            capture_output=True, text=True,
-            timeout=IDE_TIMEOUT_SECONDS,
-            env={
-                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                "HOME": os.environ.get("HOME", "/tmp"),
-                "PYTHONDONTWRITEBYTECODE": "1",
-            }
-        )
-        duration_ms = int((time.time() - t0) * 1000)
-
-        stdout = proc.stdout[:IDE_MAX_OUTPUT_LENGTH] if proc.stdout else ""
-        stderr = proc.stderr[:IDE_MAX_OUTPUT_LENGTH] if proc.stderr else ""
-
-        return jsonify({
-            "stdout":      stdout,
-            "stderr":      stderr,
-            "returncode":  proc.returncode,
-            "duration_ms": duration_ms,
-        })
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": f"Timeout : le code a dépassé {IDE_TIMEOUT_SECONDS}s d'exécution"}), 408
-    except Exception as exc:
-        logger.error("Erreur exécution IDE : %s", exc)
-        return jsonify({"error": str(exc)}), 500
-    finally:
-        try:
-            import os as _os
-            _os.unlink(tmp_path)
-        except Exception:
-            pass
-
-
-@ide_bp.route("/api/ide/ask", methods=["POST"])
-def ide_ask():
-    """Endpoint IA pour l'assistant IDE Python."""
-    data = request.get_json(force=True, silent=True) or {}
-    messages = data.get("messages", [])
-    model    = data.get("model", DEFAULT_MODEL)
-    if not messages:
-        return jsonify({"error": "Messages vides"}), 400
-    if model not in ALLOWED_MODELS:
-        model = DEFAULT_MODEL
-    try:
-        reply = call_llm_with_retry(messages, model=model, max_tokens=4000, step_name="IDE-AI")
-        return jsonify({"reply": reply})
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 502
-
-
-# ===========================================================================
-# APPLICATION
-# ===========================================================================
-
-def create_app() -> Flask:
-    application = Flask(__name__)
-    application.config["MAX_CONTENT_LENGTH"]   = 50 * 1024 * 1024
-    application.config["MAX_FORM_MEMORY_SIZE"] = 50 * 1024 * 1024
-    application.secret_key = os.environ.get("SECRET_KEY", "change-me-in-production-use-os-urandom")
-    application.register_blueprint(auth_bp)
-    application.register_blueprint(chat_bp)
-    application.register_blueprint(warroom_bp)
-    application.register_blueprint(ide_bp)
-    return application
-
-
-app = create_app()
-
-if __name__ == "__main__":
-    logger.info("NeuralChat — starting")
-    init_db()
-    port  = int(os.environ.get("PORT", 5000))
-    debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
-    app.run(host="0.0.0.0", port=port, debug=debug)
+</html>
