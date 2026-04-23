@@ -1728,6 +1728,115 @@ def get_feedback():
 
 
 # ===========================================================================
+# IDE PYTHON — Exécution sécurisée de code
+# ===========================================================================
+
+import subprocess
+import sys
+import tempfile
+
+ide_bp = Blueprint("ide", __name__)
+
+IDE_TIMEOUT_SECONDS = 15
+IDE_MAX_CODE_LENGTH = 50_000
+IDE_MAX_OUTPUT_LENGTH = 20_000
+
+_IDE_BLOCKED_IMPORTS = [
+    "os.system", "subprocess", "shutil.rmtree", "__import__('os').system",
+    "eval(", "exec(", "open('/etc", "open('/proc", "open('/sys",
+]
+
+
+def _code_is_safe(code: str) -> tuple[bool, str]:
+    """Vérifie basiquement que le code n'est pas dangereux."""
+    lower = code.lower()
+    danger_patterns = [
+        ("import subprocess", "subprocess non autorisé"),
+        ("import shutil", "shutil non autorisé (rm)"),
+        ("os.system(", "os.system non autorisé"),
+        ("os.popen(", "os.popen non autorisé"),
+        ("__import__('os')", "__import__ os non autorisé"),
+        ("open('/etc", "accès /etc non autorisé"),
+        ("open('/proc", "accès /proc non autorisé"),
+    ]
+    for pattern, msg in danger_patterns:
+        if pattern.lower() in lower:
+            return False, msg
+    return True, ""
+
+
+@ide_bp.route("/api/execute", methods=["POST"])
+def execute_code():
+    """Exécute du code Python dans un subprocess isolé avec timeout."""
+    data = request.get_json(force=True, silent=True) or {}
+    code = data.get("code", "").strip()
+    if not code:
+        return jsonify({"error": "Code vide"}), 400
+    if len(code) > IDE_MAX_CODE_LENGTH:
+        return jsonify({"error": f"Code trop long (max {IDE_MAX_CODE_LENGTH} chars)"}), 400
+
+    safe, reason = _code_is_safe(code)
+    if not safe:
+        return jsonify({"error": f"Code non autorisé : {reason}"}), 403
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", encoding="utf-8", delete=False) as tmp:
+            tmp.write(code)
+            tmp_path = tmp.name
+
+        t0 = time.time()
+        proc = subprocess.run(
+            [sys.executable, tmp_path],
+            capture_output=True, text=True,
+            timeout=IDE_TIMEOUT_SECONDS,
+            env={
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": os.environ.get("HOME", "/tmp"),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+        )
+        duration_ms = int((time.time() - t0) * 1000)
+
+        stdout = proc.stdout[:IDE_MAX_OUTPUT_LENGTH] if proc.stdout else ""
+        stderr = proc.stderr[:IDE_MAX_OUTPUT_LENGTH] if proc.stderr else ""
+
+        return jsonify({
+            "stdout":      stdout,
+            "stderr":      stderr,
+            "returncode":  proc.returncode,
+            "duration_ms": duration_ms,
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": f"Timeout : le code a dépassé {IDE_TIMEOUT_SECONDS}s d'exécution"}), 408
+    except Exception as exc:
+        logger.error("Erreur exécution IDE : %s", exc)
+        return jsonify({"error": str(exc)}), 500
+    finally:
+        try:
+            import os as _os
+            _os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+@ide_bp.route("/api/ide/ask", methods=["POST"])
+def ide_ask():
+    """Endpoint IA pour l'assistant IDE Python."""
+    data = request.get_json(force=True, silent=True) or {}
+    messages = data.get("messages", [])
+    model    = data.get("model", DEFAULT_MODEL)
+    if not messages:
+        return jsonify({"error": "Messages vides"}), 400
+    if model not in ALLOWED_MODELS:
+        model = DEFAULT_MODEL
+    try:
+        reply = call_llm_with_retry(messages, model=model, max_tokens=4000, step_name="IDE-AI")
+        return jsonify({"reply": reply})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+
+
+# ===========================================================================
 # APPLICATION
 # ===========================================================================
 
@@ -1739,6 +1848,7 @@ def create_app() -> Flask:
     application.register_blueprint(auth_bp)
     application.register_blueprint(chat_bp)
     application.register_blueprint(warroom_bp)
+    application.register_blueprint(ide_bp)
     return application
 
 
