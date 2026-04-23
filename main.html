@@ -563,6 +563,161 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
   #sidebar-toggle { display: block; }
   #experts-grid { grid-template-columns: 1fr; }
 }
+
+/* ── IDE PYTHON ── */
+#ide-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.9);
+  z-index: 2000; opacity: 0; visibility: hidden; transition: all .3s;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+#ide-overlay.active { opacity: 1; visibility: visible; }
+#ide-header {
+  padding: 14px 24px; border-bottom: 1px solid rgba(22,163,74,.3);
+  display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+  background: linear-gradient(90deg, rgba(22,163,74,.07), rgba(21,128,61,.05));
+}
+#ide-header h2 {
+  font-family: 'Syne', sans-serif; font-size: 18px; font-weight: 800;
+  background: linear-gradient(135deg, #4ade80, #16a34a);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+  display: flex; align-items: center; gap: 10px;
+}
+#ide-close {
+  background: none; border: 1px solid rgba(22,163,74,.4); border-radius: 8px;
+  color: #4ade80; padding: 6px 14px; cursor: pointer; font-size: 13px;
+  transition: all .2s; font-family: 'Syne', sans-serif; font-weight: 600;
+}
+#ide-close:hover { background: rgba(22,163,74,.1); }
+#ide-body {
+  flex: 1; display: flex; overflow: hidden; gap: 0;
+}
+#ide-left {
+  display: flex; flex-direction: column; flex: 1; border-right: 1px solid var(--border); overflow: hidden;
+}
+#ide-toolbar {
+  display: flex; align-items: center; gap: 8px; padding: 10px 16px;
+  border-bottom: 1px solid var(--border); flex-shrink: 0;
+  background: var(--panel);
+}
+#ide-toolbar .ide-filename {
+  font-size: 12px; color: var(--muted); font-family: 'JetBrains Mono', monospace;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 5px 10px; outline: none; color: var(--text); width: 160px;
+}
+#ide-toolbar .ide-filename:focus { border-color: #4ade80; }
+#ide-run-btn {
+  padding: 7px 18px; background: linear-gradient(135deg, #16a34a, #15803d);
+  border: none; border-radius: 8px; color: #fff;
+  font-family: 'Syne', sans-serif; font-weight: 700; font-size: 13px;
+  cursor: pointer; transition: opacity .2s; display: flex; align-items: center; gap: 6px;
+}
+#ide-run-btn:hover:not(:disabled) { opacity: .88; }
+#ide-run-btn:disabled { opacity: .4; cursor: not-allowed; }
+#ide-clear-btn {
+  padding: 7px 14px; background: transparent; border: 1px solid var(--border);
+  border-radius: 8px; color: var(--muted); font-family: 'Syne', sans-serif;
+  font-weight: 600; font-size: 12px; cursor: pointer; transition: all .2s;
+}
+#ide-clear-btn:hover { border-color: var(--danger); color: var(--danger); }
+#ide-send-chat-btn {
+  padding: 7px 14px; background: transparent; border: 1px solid rgba(59,130,246,.4);
+  border-radius: 8px; color: var(--accent); font-family: 'Syne', sans-serif;
+  font-weight: 600; font-size: 12px; cursor: pointer; transition: all .2s; margin-left: auto;
+}
+#ide-send-chat-btn:hover { background: rgba(59,130,246,.1); }
+#ide-editor-wrap {
+  flex: 1; overflow: hidden; position: relative;
+}
+#ide-editor {
+  width: 100%; height: 100%; padding: 16px; resize: none; outline: none;
+  background: #0d1117; color: #e6edf3;
+  border: none; font-family: 'JetBrains Mono', monospace; font-size: 13px;
+  line-height: 1.65; tab-size: 4;
+  white-space: pre; overflow-wrap: normal; overflow-x: auto;
+}
+#ide-output-panel {
+  height: 200px; flex-shrink: 0; border-top: 1px solid var(--border);
+  display: flex; flex-direction: column; background: #0a0f1e;
+}
+#ide-output-tabs {
+  display: flex; gap: 0; border-bottom: 1px solid var(--border); flex-shrink: 0;
+}
+.ide-otab {
+  padding: 7px 16px; font-size: 11px; font-family: 'Syne', sans-serif; font-weight: 700;
+  border: none; background: transparent; color: var(--muted); cursor: pointer;
+  border-bottom: 2px solid transparent; transition: all .2s; letter-spacing: .3px;
+}
+.ide-otab.active { color: #4ade80; border-bottom-color: #4ade80; }
+.ide-otab.error  { color: var(--danger); }
+#ide-output-content {
+  flex: 1; overflow-y: auto; padding: 12px 16px;
+  font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.7;
+  color: #c9d1d9;
+}
+#ide-output-content .out-success { color: #4ade80; }
+#ide-output-content .out-error   { color: #f87171; }
+#ide-output-content .out-meta    { color: var(--muted); font-size: 10px; }
+#ide-output-content .out-empty   { color: #334155; font-style: italic; }
+
+/* IDE RIGHT — AI assistant */
+#ide-right {
+  width: 360px; min-width: 300px; display: flex; flex-direction: column;
+  background: var(--panel); overflow: hidden;
+}
+#ide-ai-header {
+  padding: 12px 16px; border-bottom: 1px solid var(--border); flex-shrink: 0;
+  font-family: 'Syne', sans-serif; font-size: 12px; font-weight: 700;
+  color: var(--accent2); letter-spacing: .5px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+#ide-ai-messages {
+  flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px;
+}
+.ide-ai-msg {
+  padding: 10px 14px; border-radius: 10px; font-size: 12px; line-height: 1.65;
+  animation: fadeIn .25s ease;
+}
+.ide-ai-msg.user { background: var(--user-bg); color: #c7d9f8; align-self: flex-end; max-width: 90%; border-top-right-radius: 3px; }
+.ide-ai-msg.bot  { background: var(--bg); border: 1px solid var(--border); align-self: flex-start; max-width: 95%; border-top-left-radius: 3px; }
+.ide-ai-msg.bot code { background: rgba(59,130,246,.15); color: var(--accent2); padding: 1px 5px; border-radius: 3px; font-size: 11px; }
+.ide-ai-msg.bot pre  { background: #0d1117; border-radius: 6px; padding: 10px; overflow-x: auto; margin: 6px 0; border: 1px solid var(--border); font-size: 11px; }
+.ide-ai-insert-btn {
+  margin-top: 6px; padding: 4px 10px; font-size: 10px; border-radius: 6px;
+  border: 1px solid rgba(74,222,128,.4); background: transparent; color: #4ade80;
+  cursor: pointer; font-family: 'Syne', sans-serif; font-weight: 700; transition: all .2s;
+}
+.ide-ai-insert-btn:hover { background: rgba(74,222,128,.1); }
+#ide-ai-input-area {
+  padding: 12px; border-top: 1px solid var(--border); flex-shrink: 0; display: flex; flex-direction: column; gap: 8px;
+}
+#ide-ai-quick-btns {
+  display: flex; gap: 6px; flex-wrap: wrap;
+}
+.ide-quick-btn {
+  padding: 4px 10px; border-radius: 6px; border: 1px solid var(--border);
+  background: transparent; color: var(--muted); font-size: 10px;
+  cursor: pointer; transition: all .15s; font-family: 'Syne', sans-serif; font-weight: 600;
+  white-space: nowrap;
+}
+.ide-quick-btn:hover { border-color: var(--accent2); color: var(--accent2); }
+#ide-ai-input-row { display: flex; gap: 8px; }
+#ide-ai-input {
+  flex: 1; padding: 9px 12px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; color: var(--text); font-family: 'JetBrains Mono', monospace;
+  font-size: 12px; outline: none; resize: none; min-height: 38px; max-height: 90px;
+  transition: border-color .2s;
+}
+#ide-ai-input:focus { border-color: var(--accent2); }
+#ide-ai-send-btn {
+  padding: 9px 14px; background: linear-gradient(135deg, var(--accent), var(--accent2));
+  border: none; border-radius: 8px; color: #fff; font-family: 'Syne', sans-serif;
+  font-weight: 700; font-size: 12px; cursor: pointer; transition: opacity .2s; white-space: nowrap;
+}
+#ide-ai-send-btn:hover:not(:disabled) { opacity: .88; }
+#ide-ai-send-btn:disabled { opacity: .4; cursor: not-allowed; }
+@media (max-width: 900px) {
+  #ide-right { display: none; }
+}
 </style>
 </head>
 <body>
@@ -840,6 +995,78 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
 
 
 <!-- ══════════════════════════════════════════════════════════
+     🐍 IDE PYTHON OVERLAY
+══════════════════════════════════════════════════════════ -->
+<div id="ide-overlay">
+  <div id="ide-header">
+    <h2>🐍 IDE Python — Éditeur IA</h2>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <span id="ide-status" style="font-size:11px;color:var(--muted);font-family:'JetBrains Mono',monospace;"></span>
+      <button id="ide-close" onclick="closeIDE()">✕ Fermer</button>
+    </div>
+  </div>
+  <div id="ide-body">
+
+    <!-- LEFT : Éditeur + output -->
+    <div id="ide-left">
+      <div id="ide-toolbar">
+        <input type="text" class="ide-filename" id="ide-filename" value="script.py" placeholder="nom_fichier.py"/>
+        <button id="ide-run-btn" onclick="ideRun()">
+          <span id="ide-run-icon">▶</span> Exécuter
+        </button>
+        <button id="ide-clear-btn" onclick="ideEditor.value = ''; ideEditor.focus();">🗑 Vider</button>
+        <button id="ide-send-chat-btn" onclick="ideSendToChat()">💬 Envoyer dans le chat</button>
+      </div>
+      <div id="ide-editor-wrap">
+        <textarea id="ide-editor" spellcheck="false" autocorrect="off" autocapitalize="off"
+          placeholder="# Écris ton code Python ici…&#10;print('Hello, NeuralChat!')"></textarea>
+      </div>
+      <div id="ide-output-panel">
+        <div id="ide-output-tabs">
+          <button class="ide-otab active" id="ide-tab-out" onclick="ideShowTab('out')">▶ Sortie</button>
+          <button class="ide-otab" id="ide-tab-err" onclick="ideShowTab('err')">⚠ Erreurs</button>
+          <span style="margin-left:auto;padding:7px 14px;font-size:10px;color:var(--muted);font-family:'JetBrains Mono',monospace;" id="ide-duration"></span>
+        </div>
+        <div id="ide-output-content">
+          <span class="out-empty">Clique sur ▶ Exécuter pour voir la sortie ici.</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT : Aide IA -->
+    <div id="ide-right">
+      <div id="ide-ai-header">
+        🤖 Aide IA Python
+        <button onclick="clearIdeAI()" style="background:none;border:1px solid var(--border);border-radius:6px;color:var(--muted);font-size:10px;padding:3px 8px;cursor:pointer;font-family:'Syne',sans-serif;font-weight:600;transition:all .2s;" onmouseover="this.style.color='var(--danger)'" onmouseout="this.style.color='var(--muted)'">Vider</button>
+      </div>
+      <div id="ide-ai-messages">
+        <div class="ide-ai-msg bot">
+          👋 Bonjour ! Je suis ton assistant Python.<br/><br/>
+          Je peux <strong>écrire du code</strong>, <strong>expliquer des erreurs</strong>, <strong>optimiser</strong> ou <strong>ajouter des fonctionnalités</strong>.<br/><br/>
+          Utilise les boutons rapides ou pose-moi une question.
+        </div>
+      </div>
+      <div id="ide-ai-input-area">
+        <div id="ide-ai-quick-btns">
+          <button class="ide-quick-btn" onclick="ideAIQuick('Explique ce code')">🔍 Expliquer</button>
+          <button class="ide-quick-btn" onclick="ideAIQuick('Corrige les erreurs')">🔧 Corriger</button>
+          <button class="ide-quick-btn" onclick="ideAIQuick('Optimise les performances')">⚡ Optimiser</button>
+          <button class="ide-quick-btn" onclick="ideAIQuick('Ajoute des commentaires détaillés')">💬 Commenter</button>
+          <button class="ide-quick-btn" onclick="ideAIQuick('Génère des tests unitaires')">🧪 Tests</button>
+          <button class="ide-quick-btn" onclick="ideAIQuick('Explique l\'erreur dans la sortie')">❌ Erreur ?</button>
+        </div>
+        <div id="ide-ai-input-row">
+          <textarea id="ide-ai-input" placeholder="Pose une question sur ton code…" rows="1"
+            onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();ideAISend();}"></textarea>
+          <button id="ide-ai-send-btn" onclick="ideAISend()">Envoyer</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
      SIDEBAR
 ══════════════════════════════════════════════════════════ -->
 <aside id="sidebar">
@@ -876,6 +1103,7 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
     <div style="display:flex;flex-direction:column;gap:8px;">
       <button class="btn btn-war btn-full" onclick="openWarRoom()">⚔️ War Room</button>
       <button class="btn btn-advocate btn-full" onclick="openAdvocate()">😈 Avocat du Diable</button>
+      <button class="btn btn-full" onclick="openIDE()" style="background:linear-gradient(135deg,#16a34a,#15803d);color:#fff;">🐍 IDE Python</button>
     </div>
   </div>
 
@@ -931,6 +1159,7 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
       <div class="features">
         <span class="feature-pill war">⚔️ War Room Multi-Agents</span>
         <span class="feature-pill devil">😈 Avocat du Diable</span>
+        <span class="feature-pill" style="border-color:rgba(22,163,74,.4);color:#4ade80;background:rgba(22,163,74,.05);">🐍 IDE Python</span>
         <span class="feature-pill" style="border-color:rgba(6,182,212,.4);color:var(--accent2);background:rgba(6,182,212,.05);">🌐 Choix de langue</span>
       </div>
       <div class="hint">Entrée pour envoyer · Shift+Entrée pour un saut de ligne</div>
@@ -958,6 +1187,7 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
   <div class="special-tools" style="padding-bottom:12px;">
     <button class="tool-btn war"   onclick="openWarRoom()">⚔️ War Room</button>
     <button class="tool-btn devil" onclick="openAdvocate()">😈 Avocat du Diable</button>
+    <button class="tool-btn" onclick="openIDE()" style="border-color:rgba(22,163,74,.5);color:#4ade80;">🐍 IDE Python</button>
     <button class="tool-btn" onclick="prefillCurrentMessage()" style="border-color:rgba(100,116,139,.4);" title="Utiliser le message actuel comme base">📋 Utiliser message</button>
   </div>
 </div>
@@ -2127,6 +2357,240 @@ document.addEventListener('keydown', e => {
     }
   } catch (e) { console.error('Init error:', e); }
 })();
+
+/* ===================================================
+   🐍 IDE PYTHON
+   =================================================== */
+const ideEditor = document.getElementById('ide-editor');
+let ideLastStdout = '';
+let ideLastStderr = '';
+let ideAIHistory  = [];   // { role, content }
+
+function openIDE() { document.getElementById('ide-overlay').classList.add('active'); ideEditor.focus(); }
+function closeIDE() { document.getElementById('ide-overlay').classList.remove('active'); }
+
+/* Tab indentation in editor */
+ideEditor.addEventListener('keydown', e => {
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    const start = ideEditor.selectionStart;
+    const end   = ideEditor.selectionEnd;
+    ideEditor.value = ideEditor.value.substring(0, start) + '    ' + ideEditor.value.substring(end);
+    ideEditor.selectionStart = ideEditor.selectionEnd = start + 4;
+  }
+});
+
+/* Run code */
+async function ideRun() {
+  const code = ideEditor.value.trim();
+  if (!code) return showToast('Éditeur vide', 'error');
+  const runBtn = document.getElementById('ide-run-btn');
+  const icon   = document.getElementById('ide-run-icon');
+  runBtn.disabled = true;
+  icon.textContent = '⏳';
+  document.getElementById('ide-status').textContent = 'Exécution…';
+  document.getElementById('ide-output-content').innerHTML = '<span class="out-meta">Exécution en cours…</span>';
+
+  try {
+    const res  = await fetch('/api/execute', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
+    });
+    const data = await res.json();
+
+    if (data.error) {
+      document.getElementById('ide-output-content').innerHTML =
+        `<span class="out-error">❌ ${escHtml(data.error)}</span>`;
+      document.getElementById('ide-status').textContent = '❌ Erreur';
+      showToast(data.error, 'error');
+      return;
+    }
+
+    ideLastStdout = data.stdout || '';
+    ideLastStderr = data.stderr || '';
+    const dur     = data.duration_ms;
+    document.getElementById('ide-duration').textContent = `${dur}ms`;
+
+    /* update output tab */
+    const errTab = document.getElementById('ide-tab-err');
+    errTab.classList.toggle('error', !!ideLastStderr);
+
+    ideShowTab('out');
+
+    const status = data.returncode === 0 ? `✅ ${dur}ms` : `⚠ code ${data.returncode}`;
+    document.getElementById('ide-status').textContent = status;
+    showToast(data.returncode === 0 ? 'Exécution réussie' : 'Terminé avec erreurs', data.returncode === 0 ? 'success' : 'warn');
+
+  } catch (err) {
+    document.getElementById('ide-output-content').innerHTML = `<span class="out-error">Erreur réseau : ${escHtml(String(err))}</span>`;
+    document.getElementById('ide-status').textContent = '❌';
+  } finally {
+    runBtn.disabled = false;
+    icon.textContent = '▶';
+  }
+}
+
+function ideShowTab(tab) {
+  document.getElementById('ide-tab-out').classList.toggle('active', tab === 'out');
+  document.getElementById('ide-tab-err').classList.toggle('active', tab === 'err');
+  const out = document.getElementById('ide-output-content');
+  if (tab === 'out') {
+    if (!ideLastStdout && ideLastStderr === undefined) {
+      out.innerHTML = '<span class="out-empty">Aucune sortie.</span>';
+    } else {
+      out.innerHTML = ideLastStdout
+        ? `<pre class="out-success" style="white-space:pre-wrap;margin:0;">${escHtml(ideLastStdout)}</pre>`
+        : '<span class="out-empty">Aucune sortie stdout.</span>';
+    }
+  } else {
+    out.innerHTML = ideLastStderr
+      ? `<pre class="out-error" style="white-space:pre-wrap;margin:0;">${escHtml(ideLastStderr)}</pre>`
+      : '<span class="out-empty" style="color:var(--success);">Aucune erreur. ✅</span>';
+  }
+}
+
+function ideSendToChat() {
+  const code = ideEditor.value.trim();
+  if (!code) return showToast('Éditeur vide', 'error');
+  closeIDE();
+  document.getElementById('welcome')?.remove();
+  const filename = document.getElementById('ide-filename').value || 'script.py';
+  appendMessage('bot', `**🐍 Code Python — ${escHtml(filename)}**\n\`\`\`python\n${code}\n\`\`\``);
+  showToast('Code envoyé dans le chat', 'success');
+}
+
+/* ── IDE AI assistant ── */
+function clearIdeAI() {
+  ideAIHistory = [];
+  document.getElementById('ide-ai-messages').innerHTML = `
+    <div class="ide-ai-msg bot">Chat IA réinitialisé. Prêt à t'aider !</div>`;
+}
+
+function ideAIQuick(prompt) {
+  const input = document.getElementById('ide-ai-input');
+  input.value = prompt;
+  ideAISend();
+}
+
+function _ideAddMsg(role, html, rawCode) {
+  const wrap = document.createElement('div');
+  wrap.className = `ide-ai-msg ${role}`;
+  wrap.innerHTML = html;
+  if (rawCode && role === 'bot') {
+    const insertBtn = document.createElement('button');
+    insertBtn.className = 'ide-ai-insert-btn';
+    insertBtn.textContent = '⬇ Insérer dans l\'éditeur';
+    insertBtn.onclick = () => {
+      ideEditor.value = rawCode;
+      ideEditor.focus();
+      showToast('Code inséré dans l\'éditeur', 'success');
+    };
+    wrap.appendChild(insertBtn);
+  }
+  const container = document.getElementById('ide-ai-messages');
+  container.appendChild(wrap);
+  container.scrollTop = container.scrollHeight;
+  return wrap;
+}
+
+async function ideAISend() {
+  const input   = document.getElementById('ide-ai-input');
+  const userMsg = input.value.trim();
+  if (!userMsg) return;
+  const sendBtn = document.getElementById('ide-ai-send-btn');
+  input.value = '';
+  input.style.height = 'auto';
+  sendBtn.disabled = true;
+
+  const code    = ideEditor.value.trim();
+  const stdout  = ideLastStdout;
+  const stderr  = ideLastStderr;
+
+  _ideAddMsg('user', escHtml(userMsg));
+
+  const systemContent = `Tu es un assistant Python expert intégré dans un IDE. 
+Réponds TOUJOURS en français.
+Tu as accès au code courant dans l'éditeur et à la dernière sortie d'exécution.
+Quand tu génères du code, utilise des blocs \`\`\`python ... \`\`\`.
+Sois concis, précis et fournis du code fonctionnel.`;
+
+  const contextMsg = `CODE ACTUEL DANS L'ÉDITEUR :
+\`\`\`python
+${code || '(éditeur vide)'}
+\`\`\`
+${stdout ? `\nDERNIÈRE SORTIE STDOUT :\n${stdout.slice(0, 1000)}` : ''}
+${stderr ? `\nDERNIÈRE SORTIE STDERR :\n${stderr.slice(0, 500)}` : ''}`;
+
+  ideAIHistory.push({ role: 'user', content: contextMsg + '\n\n' + userMsg });
+
+  /* streaming placeholder */
+  const placeholder = _ideAddMsg('bot', '<span style="color:var(--muted);font-size:11px;">⏳ Génération…</span>');
+
+  try {
+    const model = document.getElementById('model-select')?.value || 'openai/gpt-oss-120b:free';
+    const res   = await fetch('/api/ide/ask', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: [
+          { role: 'system', content: systemContent },
+          ...ideAIHistory,
+        ],
+        model,
+      }),
+    });
+
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    const fullText = data.reply || '';
+
+    ideAIHistory.push({ role: 'assistant', content: fullText });
+
+    placeholder.innerHTML = ideFormatAIText(fullText);
+
+    /* extract first code block for insert button */
+    const codeMatch = fullText.match(/```(?:python)?\n([\s\S]*?)```/);
+    if (codeMatch) {
+      const insertBtn = document.createElement('button');
+      insertBtn.className = 'ide-ai-insert-btn';
+      insertBtn.textContent = '⬇ Insérer dans l\'éditeur';
+      const extracted = codeMatch[1].trim();
+      insertBtn.onclick = () => {
+        ideEditor.value = extracted;
+        ideEditor.focus();
+        showToast('Code inséré dans l\'éditeur', 'success');
+      };
+      placeholder.appendChild(insertBtn);
+    }
+    document.getElementById('ide-ai-messages').scrollTop = 999999;
+
+  } catch (err) {
+    placeholder.innerHTML = `<span class="out-error">Erreur : ${escHtml(String(err))}</span>`;
+  } finally {
+    sendBtn.disabled = false;
+  }
+}
+
+function ideFormatAIText(text) {
+  /* Simple markdown-like formatting for IDE AI panel */
+  return text
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/```(?:python)?\n([\s\S]*?)```/g, (_, c) =>
+      `<pre><code>${c}</code></pre>`)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\n/g, '<br/>');
+}
+
+/* Auto-resize IDE AI textarea */
+document.getElementById('ide-ai-input').addEventListener('input', function() {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 90) + 'px';
+});
+
+/* Keyboard shortcut: Ctrl+Enter / Cmd+Enter to run */
+ideEditor.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); ideRun(); }
+});
 </script>
 </body>
 </html>
