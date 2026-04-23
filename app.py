@@ -1790,8 +1790,10 @@ def execute_code():
             capture_output=True, text=True,
             timeout=IDE_TIMEOUT_SECONDS,
             env={
-                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                "HOME": os.environ.get("HOME", "/tmp"),
+                "PATH":                    os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME":                    os.environ.get("HOME", "/tmp"),
+                "PYTHONPATH":              os.environ.get("PYTHONPATH", ""),
+                "VIRTUAL_ENV":             os.environ.get("VIRTUAL_ENV", ""),
                 "PYTHONDONTWRITEBYTECODE": "1",
             }
         )
@@ -1875,12 +1877,16 @@ def ide_install():
         if not valid:
             return jsonify({"error": reason}), 400
 
-    cmd = [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir", "--break-system-packages"] + packages
+    cmd = [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir"] + packages
     try:
         t0   = time.time()
+        # Hérite de l'environnement complet pour que pip s'installe dans
+        # le même interpréteur/virtualenv que Flask (PYTHONPATH, VIRTUAL_ENV…)
+        install_env = os.environ.copy()
         proc = subprocess.run(
             cmd, capture_output=True, text=True,
             timeout=IDE_INSTALL_TIMEOUT,
+            env=install_env,
         )
         duration_ms = int((time.time() - t0) * 1000)
         output = (proc.stdout + proc.stderr).strip()
@@ -1917,8 +1923,9 @@ def ide_uninstall():
         return jsonify({"error": reason}), 400
     try:
         proc = subprocess.run(
-            [sys.executable, "-m", "pip", "uninstall", "-y", "--break-system-packages", pkg],
+            [sys.executable, "-m", "pip", "uninstall", "-y", pkg],
             capture_output=True, text=True, timeout=60,
+            env=os.environ.copy(),
         )
         output = (proc.stdout + proc.stderr).strip()
         return jsonify({"output": output, "returncode": proc.returncode})
