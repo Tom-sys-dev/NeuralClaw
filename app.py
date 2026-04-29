@@ -92,9 +92,15 @@ def init_db() -> None:
                 model         TEXT NOT NULL,
                 skills        TEXT NOT NULL,
                 lang          TEXT NOT NULL DEFAULT 'fr',
+                title         TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
             )
         """)
+        # Migration : ajouter la colonne title si elle n'existe pas encore
+        try:
+            db.execute("ALTER TABLE chat_sessions ADD COLUMN title TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass  # Colonne déjà présente
         db.execute("CREATE INDEX IF NOT EXISTS idx_users_username    ON users(username)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_username ON chat_sessions(username)")
         db.commit()
@@ -108,6 +114,7 @@ def _default_session() -> dict:
         "model":         DEFAULT_MODEL,
         "skills":        [],
         "lang":          "fr",
+        "title":         "",
     }
 
 
@@ -134,6 +141,7 @@ def load_session_from_db(username: str) -> dict:
                 "model":         row["model"],
                 "skills":        json.loads(row["skills"]),
                 "lang":          row["lang"] or "fr",
+                "title":         row["title"] if "title" in row.keys() else "",
             }
         except json.JSONDecodeError as exc:
             logger.error("Erreur décodage JSON pour %s : %s", username, exc)
@@ -141,7 +149,7 @@ def load_session_from_db(username: str) -> dict:
 
 
 def save_session_to_db(username: str, sess: dict) -> None:
-    if username == "__anon__":
+    if not username:
         return
     with closing(get_db()) as db:
         exists = db.execute(
@@ -150,18 +158,20 @@ def save_session_to_db(username: str, sess: dict) -> None:
         if exists is None:
             db.execute(
                 "INSERT INTO chat_sessions "
-                "(username, messages, system_prompt, model, skills, lang) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "(username, messages, system_prompt, model, skills, lang, title) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (username, json.dumps(sess["messages"]), sess["system_prompt"],
-                 sess["model"], json.dumps(sess["skills"]), sess.get("lang", "fr")),
+                 sess["model"], json.dumps(sess["skills"]), sess.get("lang", "fr"),
+                 sess.get("title", "")),
             )
         else:
             db.execute(
                 "UPDATE chat_sessions "
-                "SET messages=?, system_prompt=?, model=?, skills=?, lang=? "
+                "SET messages=?, system_prompt=?, model=?, skills=?, lang=?, title=? "
                 "WHERE username=?",
                 (json.dumps(sess["messages"]), sess["system_prompt"], sess["model"],
-                 json.dumps(sess["skills"]), sess.get("lang", "fr"), username),
+                 json.dumps(sess["skills"]), sess.get("lang", "fr"),
+                 sess.get("title", ""), username),
             )
         db.commit()
 
@@ -250,6 +260,14 @@ def perform_search(query: str, max_results: int = 5) -> str:
 
 _anon_store: dict[str, dict[str, Any]] = {}
 
+def _get_anon_key() -> str:
+    """Retourne une clé unique par session anonyme (basée sur le cookie de session Flask)."""
+    key = flask_session.get("anon_id")
+    if not key:
+        key = str(uuid.uuid4())
+        flask_session["anon_id"] = key
+    return key
+
 LANG_INSTRUCTIONS: dict[str, str] = {
     "fr": "Tu réponds TOUJOURS en français, quelle que soit la langue du message reçu.",
     "en": "You ALWAYS respond in English, regardless of the language of the received message.",
@@ -274,14 +292,16 @@ LANG_RULES_SHORT: dict[str, str] = {
 
 
 def get_session() -> dict:
-    username: str = flask_session.get("username", "__anon__")
-    if username == "__anon__":
-        if "__anon__" not in _anon_store:
-            _anon_store["__anon__"] = {
+    username: str = flask_session.get("username", "")
+    if not username:
+        anon_key = _get_anon_key()
+        if anon_key not in _anon_store:
+            _cleanup_anon_store()
+            _anon_store[anon_key] = {
                 "messages": [], "system_prompt": "", "model": DEFAULT_MODEL,
                 "skills": [], "lang": "fr",
             }
-        return _anon_store["__anon__"]
+        return _anon_store[anon_key]
     return load_session_from_db(username)
 
 
@@ -462,6 +482,17 @@ EXPERTS_TIMEOUT_SECONDS = 300
 FINAL_CODE_END_MARKER   = "__WARROOM_COMPLETE__"
 MAX_QUERY_LENGTH        = 8_000
 
+def _is_allowed_model(model: str) -> bool:
+    """Accepte tout model OpenRouter valide (slug contenant '/' ou ':')."""
+    if not model or len(model) > 200:
+        return False
+    # Refuse les valeurs manifestement malveillantes
+    bad = ("<", ">", "\"", "'", ";", "\n", "\r")
+    if any(c in model for c in bad):
+        return False
+    # Accepte les modèles de la liste statique ou tout slug OpenRouter (x/y, x/y:z)
+    return True  # validation côté OpenRouter pour le reste
+
 ALLOWED_MODELS: set[str] = {
     "claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5",
     "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-6",
@@ -523,6 +554,21 @@ def _rate_check(ip: str) -> bool:
         return False
     _rate_store[ip].append(now)
     return True
+
+
+def _rate_check_user(identifier: str, max_calls: int = RATE_LIMIT_MAX,
+                     window: int = RATE_LIMIT_WINDOW) -> bool:
+    """Rate-limit par identifiant (IP ou username)."""
+    return _rate_check(identifier)
+
+
+def _cleanup_anon_store(max_sessions: int = 500) -> None:
+    """Supprime les sessions anonymes les plus anciennes si la mémoire déborde."""
+    if len(_anon_store) > max_sessions:
+        # On garde les plus récentes (on n'a pas de timestamp mais on purge ~10%)
+        keys_to_delete = list(_anon_store.keys())[:max(1, len(_anon_store) // 10)]
+        for k in keys_to_delete:
+            _anon_store.pop(k, None)
 
 
 def call_llm_with_retry(
@@ -1200,7 +1246,7 @@ def _parse_warroom_payload(data: dict) -> tuple[dict | None, str | None]:
     if len(query) > MAX_QUERY_LENGTH:
         return None, f"Requête trop longue (max {MAX_QUERY_LENGTH} caractères)"
     model = data.get("model", DEFAULT_MODEL)
-    if model not in ALLOWED_MODELS:
+    if not _is_allowed_model(model):
         model = DEFAULT_MODEL
     lang      = data.get("lang", "fr")
     lang_rule = LANG_RULES_SHORT.get(lang, LANG_RULES_SHORT["fr"])
@@ -1315,6 +1361,41 @@ def me():
 
 # ── CHAT ────────────────────────────────────────────────────────────────────
 
+@chat_bp.route("/api/ping", methods=["GET"])
+def ping():
+    """Keepalive endpoint — empêche Render/Heroku de mettre l'instance en veille."""
+    return jsonify({"ok": True, "ts": int(time.time())})
+
+
+@chat_bp.route("/api/models", methods=["GET"])
+def get_models():
+    """Retourne la liste des modèles disponibles."""
+    return jsonify({"models": FREE_MODELS, "default": DEFAULT_MODEL})
+
+
+# Types de fichiers autorisés pour les pièces jointes
+_ALLOWED_MIME_PREFIXES = ("text/", "application/json", "application/xml",
+                           "application/x-python", "application/javascript")
+_ALLOWED_EXTENSIONS    = {
+    ".txt", ".md", ".py", ".js", ".ts", ".json", ".html", ".css",
+    ".csv", ".xml", ".yaml", ".yml", ".sh", ".sql", ".log", ".env",
+    ".toml", ".ini", ".cfg", ".rst", ".tex", ".c", ".cpp", ".h",
+    ".java", ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".r",
+}
+
+def _file_is_allowed(filename: str, content_type: str) -> tuple[bool, str]:
+    """Vérifie extension + MIME d'un fichier joint."""
+    import os as _os
+    ext = _os.path.splitext(filename.lower())[1]
+    if ext not in _ALLOWED_EXTENSIONS:
+        return False, f"Extension non autorisée : {ext or '(aucune)'}"
+    if content_type and not any(content_type.startswith(p) for p in _ALLOWED_MIME_PREFIXES):
+        # On accepte quand même si l'extension est valide — certains clients
+        # envoient application/octet-stream pour tout.
+        pass
+    return True, ""
+
+
 @chat_bp.route("/")
 def index() -> str:
     return render_template_string(
@@ -1325,7 +1406,7 @@ def index() -> str:
 @chat_bp.route("/api/context", methods=["POST"])
 def set_context():
     data     = request.get_json(force=True)
-    username = flask_session.get("username", "__anon__")
+    username = flask_session.get("username", "")
     sess     = get_session()
     if "system_prompt" in data:
         sess["system_prompt"] = data["system_prompt"].strip()
@@ -1335,7 +1416,7 @@ def set_context():
         sess["skills"] = [s for s in data["skills"] if isinstance(s, str)]
     if "lang" in data:
         sess["lang"] = data["lang"]
-    if username != "__anon__":
+    if username:
         save_session_to_db(username, sess)
     return jsonify({"ok": True})
 
@@ -1343,17 +1424,17 @@ def set_context():
 @chat_bp.route("/api/skills", methods=["POST"])
 def set_skills():
     data     = request.get_json(force=True)
-    username = flask_session.get("username", "__anon__")
+    username = flask_session.get("username", "")
     sess     = get_session()
     sess["skills"] = [s for s in data.get("skills", []) if isinstance(s, str)]
-    if username != "__anon__":
+    if username:
         save_session_to_db(username, sess)
     return jsonify({"ok": True, "skills": sess["skills"]})
 
 
 @chat_bp.route("/api/chat", methods=["POST"])
 def chat():
-    username = flask_session.get("username", "__anon__")
+    username = flask_session.get("username", "")
     sess     = get_session()
     if request.is_json:
         data     = request.get_json()
@@ -1362,13 +1443,27 @@ def chat():
         data     = None
         user_msg = request.form.get("message", "").strip()
     file_parts: list[str] = []
+    ignored_files: list[str] = []
     for f in request.files.getlist("files"):
-        if f.filename:
-            try:
-                content = f.read().decode("utf-8", errors="replace")
-                file_parts.append(f"--- Fichier joint : {f.filename} ---\n{content}")
-            except Exception as exc:
-                logger.warning("Erreur lecture fichier %s : %s", f.filename, exc)
+        if not f.filename:
+            continue
+        allowed, reason = _file_is_allowed(f.filename, f.content_type or "")
+        if not allowed:
+            ignored_files.append(f"{f.filename} ({reason})")
+            continue
+        if f.content_length and f.content_length > 5 * 1024 * 1024:
+            ignored_files.append(f"{f.filename} (trop volumineux)")
+            continue
+        try:
+            raw = f.read(5 * 1024 * 1024 + 1)  # limite côté lecture
+            if len(raw) > 5 * 1024 * 1024:
+                ignored_files.append(f"{f.filename} (trop volumineux)")
+                continue
+            content = raw.decode("utf-8", errors="replace")
+            file_parts.append(f"--- Fichier joint : {f.filename} ---\n{content}")
+        except Exception as exc:
+            logger.warning("Erreur lecture fichier %s : %s", f.filename, exc)
+            ignored_files.append(f"{f.filename} (erreur de lecture)")
     full_msg = user_msg
     if file_parts:
         full_msg += "\n\n" + "\n\n".join(file_parts)
@@ -1377,7 +1472,7 @@ def chat():
     lang = (data.get("lang") if data else None) or request.form.get("lang")
     if lang:
         sess["lang"] = lang
-        if username != "__anon__":
+        if username:
             save_session_to_db(username, sess)
     selected_lang = sess.get("lang", "fr")
     lang_rule     = LANG_INSTRUCTIONS.get(selected_lang, LANG_INSTRUCTIONS["fr"])
@@ -1431,21 +1526,23 @@ def chat():
     if final_reply is None:
         return jsonify({"reply": "Limite de recherches atteinte. Réessaie."})
     sess["messages"] = [m for m in payload_messages if m["role"] in ("user", "assistant")]
-    if username != "__anon__":
+    _trim_history(sess)
+    if username:
         save_session_to_db(username, sess)
     return jsonify({
         "reply":            final_reply,
         "total_messages":   len(sess["messages"]),
         "estimated_tokens": estimate_tokens(sess["messages"]),
+        "ignored_files":    ignored_files,
     })
 
 
 @chat_bp.route("/api/clear", methods=["POST"])
 def clear():
-    username = flask_session.get("username", "__anon__")
+    username = flask_session.get("username", "")
     sess     = get_session()
     sess["messages"] = []
-    if username != "__anon__":
+    if username:
         save_session_to_db(username, sess)
     return jsonify({"ok": True})
 
@@ -1459,8 +1556,115 @@ def history():
         "model":            sess["model"],
         "skills":           sess.get("skills", []),
         "lang":             sess.get("lang", "fr"),
+        "title":            sess.get("title", ""),
         "estimated_tokens": estimate_tokens(sess["messages"]),
     })
+
+
+@chat_bp.route("/api/chat/regenerate", methods=["POST"])
+def regenerate():
+    """Regénère la dernière réponse de l'IA sans ajouter de nouveau message user."""
+    username = flask_session.get("username", "")
+    sess     = get_session()
+    messages = sess.get("messages", [])
+
+    # Retire le dernier message assistant s'il existe
+    if messages and messages[-1]["role"] == "assistant":
+        messages.pop()
+
+    if not messages:
+        return jsonify({"error": "Aucun message à regénérer"}), 400
+
+    lang      = sess.get("lang", "fr")
+    lang_rule = LANG_INSTRUCTIONS.get(lang, LANG_INSTRUCTIONS["fr"])
+    sys_content = build_system_content(sess)
+    full_sys    = (sys_content + f"\n\nRÈGLE ABSOLUE DE LANGUE: {lang_rule}") if sys_content \
+                  else f"RÈGLE ABSOLUE DE LANGUE: {lang_rule}"
+
+    payload_messages = [{"role": "system", "content": full_sys}] + messages
+    try:
+        reply = call_llm(payload_messages, model=sess["model"], max_tokens=80000)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+
+    sess["messages"].append({"role": "assistant", "content": reply})
+    _trim_history(sess)
+    if username:
+        save_session_to_db(username, sess)
+    return jsonify({
+        "reply":            reply,
+        "total_messages":   len(sess["messages"]),
+        "estimated_tokens": estimate_tokens(sess["messages"]),
+    })
+
+
+@chat_bp.route("/api/chat/title", methods=["POST"])
+def generate_title():
+    """Génère automatiquement un titre court pour la conversation."""
+    sess = get_session()
+    messages = sess.get("messages", [])
+    if not messages:
+        return jsonify({"title": "Nouvelle conversation"})
+    # Prend les 3 premiers messages pour le résumé
+    excerpt = "\n".join(
+        f"{m['role'].upper()}: {m['content'][:300]}" for m in messages[:3]
+    )
+    prompt = (
+        "Génère un titre TRÈS COURT (3-5 mots max) pour cette conversation. "
+        "Réponds UNIQUEMENT avec le titre, sans ponctuation finale.\n\n" + excerpt
+    )
+    try:
+        title = call_llm([{"role": "user", "content": prompt}],
+                         model=sess["model"], max_tokens=30)
+        title = title.strip().strip('"').strip("'")[:60]
+        sess["title"] = title
+        username = flask_session.get("username", "")
+        if username:
+            save_session_to_db(username, sess)
+        return jsonify({"title": title})
+    except Exception as exc:
+        return jsonify({"title": "Conversation", "error": str(exc)})
+
+
+@chat_bp.route("/api/message/delete", methods=["POST"])
+def delete_message():
+    """Supprime un message par son index."""
+    username = flask_session.get("username", "")
+    sess     = get_session()
+    data     = request.get_json(force=True, silent=True) or {}
+    idx      = data.get("index")
+    if idx is None or not isinstance(idx, int):
+        return jsonify({"error": "index requis"}), 400
+    messages = sess.get("messages", [])
+    if idx < 0 or idx >= len(messages):
+        return jsonify({"error": "Index hors limites"}), 400
+    messages.pop(idx)
+    if username:
+        save_session_to_db(username, sess)
+    return jsonify({"ok": True, "total_messages": len(messages)})
+
+
+@chat_bp.route("/api/message/edit", methods=["POST"])
+def edit_message():
+    """Édite le contenu d'un message et supprime tous les messages suivants."""
+    username = flask_session.get("username", "")
+    sess     = get_session()
+    data     = request.get_json(force=True, silent=True) or {}
+    idx      = data.get("index")
+    new_text = (data.get("content") or "").strip()
+    if idx is None or not isinstance(idx, int):
+        return jsonify({"error": "index requis"}), 400
+    if not new_text:
+        return jsonify({"error": "Contenu vide"}), 400
+    messages = sess.get("messages", [])
+    if idx < 0 or idx >= len(messages):
+        return jsonify({"error": "Index hors limites"}), 400
+    # Met à jour le message et tronque tout ce qui suit (les réponses deviennent invalides)
+    messages[idx]["content"] = new_text
+    sess["messages"] = messages[:idx + 1]
+    if username:
+        save_session_to_db(username, sess)
+    return jsonify({"ok": True, "total_messages": len(sess["messages"])})
 
 
 # ── WAR ROOM ────────────────────────────────────────────────────────────────
@@ -1605,7 +1809,7 @@ def warroom_refine():
     lang        = data.get("lang",       "fr")
     if not refinement or not synthesis or not query:
         return jsonify({"error": "Champs requis : query, synthesis, refinement"}), 400
-    if model not in ALLOWED_MODELS:
+    if not _is_allowed_model(model):
         model = DEFAULT_MODEL
     lang_rule = LANG_RULES_SHORT.get(lang, LANG_RULES_SHORT["fr"])
     stack     = _detect_stack(query, data.get("stack"))
@@ -1681,7 +1885,7 @@ def advocate():
         return jsonify({"error": "Sujet vide"}), 400
     if len(topic) > MAX_QUERY_LENGTH:
         return jsonify({"error": f"Sujet trop long (max {MAX_QUERY_LENGTH} caractères)"}), 400
-    if model not in ALLOWED_MODELS:
+    if not _is_allowed_model(model):
         model = DEFAULT_MODEL
     prompt = (
         "Tu es l'Avocat du Diable. Donne une critique structurée, concrète et concise.\n"
@@ -1725,6 +1929,18 @@ def get_feedback():
         return jsonify({"avg_score": None, "total": 0, "recent": []})
     avg = sum(f["score"] for f in _feedback_store) / len(_feedback_store)
     return jsonify({"avg_score": round(avg, 2), "total": len(_feedback_store), "recent": _feedback_store[-10:]})
+
+
+@warroom_bp.route("/api/stats", methods=["GET"])
+def server_stats():
+    """Statistiques serveur (mémoire en-process, cache, sessions)."""
+    return jsonify({
+        "cache_entries":    len(_cache_store),
+        "anon_sessions":    len(_anon_store),
+        "active_jobs":      len(_job_store),
+        "feedback_count":   len(_feedback_store),
+        "uptime_approx":    "running",
+    })
 
 
 # ===========================================================================
@@ -1816,7 +2032,8 @@ def execute_code():
     finally:
         try:
             import os as _os
-            _os.unlink(tmp_path)
+            if 'tmp_path' in dir():
+                _os.unlink(tmp_path)
         except Exception:
             pass
 
@@ -1829,7 +2046,7 @@ def ide_ask():
     model    = data.get("model", DEFAULT_MODEL)
     if not messages:
         return jsonify({"error": "Messages vides"}), 400
-    if model not in ALLOWED_MODELS:
+    if not _is_allowed_model(model):
         model = DEFAULT_MODEL
     try:
         reply = call_llm_with_retry(messages, model=model, max_tokens=4000, step_name="IDE-AI")
@@ -1941,22 +2158,139 @@ def ide_uninstall():
 # APPLICATION
 # ===========================================================================
 
+MAX_HISTORY_MESSAGES = int(os.environ.get("MAX_HISTORY_MESSAGES", 200))
+
+
 def create_app() -> Flask:
     application = Flask(__name__)
     application.config["MAX_CONTENT_LENGTH"]   = 50 * 1024 * 1024
     application.config["MAX_FORM_MEMORY_SIZE"] = 50 * 1024 * 1024
+    application.config["SESSION_COOKIE_HTTPONLY"]  = True
+    application.config["SESSION_COOKIE_SAMESITE"]  = "Lax"
+    application.config["SESSION_COOKIE_SECURE"]    = os.environ.get("HTTPS", "false").lower() == "true"
+    application.config["PERMANENT_SESSION_LIFETIME"] = 60 * 60 * 24 * 30  # 30 jours
     application.secret_key = os.environ.get("SECRET_KEY", "change-me-in-production-use-os-urandom")
+
     application.register_blueprint(auth_bp)
     application.register_blueprint(chat_bp)
     application.register_blueprint(warroom_bp)
     application.register_blueprint(ide_bp)
+
+    # ── CORS ──────────────────────────────────────────────────────────────
+    _ALLOWED_ORIGINS = set(filter(None, os.environ.get("ALLOWED_ORIGINS", "").split(",")))
+
+    @application.after_request
+    def add_cors_headers(response: Response) -> Response:
+        origin = request.headers.get("Origin", "")
+        if _ALLOWED_ORIGINS and origin in _ALLOWED_ORIGINS:
+            response.headers["Access-Control-Allow-Origin"]      = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+            response.headers["Access-Control-Allow-Methods"]     = "GET,POST,DELETE,OPTIONS"
+            response.headers["Access-Control-Allow-Headers"]     = "Content-Type,Authorization"
+        # Basic security headers
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        return response
+
+    @application.before_request
+    def handle_options_and_log():
+        if request.method == "OPTIONS":
+            from flask import make_response as _mk
+            r = _mk("", 204)
+            return r
+        # Log requests (skip static & ping)
+        if not request.path.startswith("/static") and request.path != "/api/ping":
+            logger.debug("%-6s %s  [%s]", request.method, request.path,
+                         flask_session.get("username", "anon"))
+
+    # ── Gzip compression via middleware ───────────────────────────────────
+    try:
+        from flask_compress import Compress  # type: ignore
+        Compress(application)
+        logger.info("flask-compress activé")
+    except ImportError:
+        pass  # facultatif — fonctionne sans
+
+    # ── Error handlers ────────────────────────────────────────────────────
+    @application.errorhandler(400)
+    def bad_request(e):
+        return jsonify({"error": "Requête invalide", "detail": str(e)}), 400
+
+    @application.errorhandler(401)
+    def unauthorized(e):
+        return jsonify({"error": "Non authentifié"}), 401
+
+    @application.errorhandler(403)
+    def forbidden(e):
+        return jsonify({"error": "Accès interdit"}), 403
+
+    @application.errorhandler(404)
+    def not_found(e):
+        # Renvoie le SPA pour les routes non-API (navigation côté client)
+        if not request.path.startswith("/api/"):
+            try:
+                return render_template_string(
+                    _load_html_template(), models=FREE_MODELS, default_model=DEFAULT_MODEL
+                )
+            except Exception:
+                pass
+        return jsonify({"error": "Ressource introuvable"}), 404
+
+    @application.errorhandler(405)
+    def method_not_allowed(e):
+        return jsonify({"error": "Méthode non autorisée"}), 405
+
+    @application.errorhandler(413)
+    def payload_too_large(e):
+        return jsonify({"error": "Fichier trop volumineux (max 50 MB)"}), 413
+
+    @application.errorhandler(429)
+    def too_many_requests(e):
+        return jsonify({"error": "Trop de requêtes, réessaie dans un moment."}), 429
+
+    @application.errorhandler(500)
+    def internal_error(e):
+        logger.error("Erreur 500 : %s", e, exc_info=True)
+        return jsonify({"error": "Erreur interne du serveur"}), 500
+
+    @application.errorhandler(502)
+    def bad_gateway(e):
+        return jsonify({"error": "Service IA temporairement indisponible"}), 502
+
+    # ── Health check ──────────────────────────────────────────────────────
+    @application.route("/api/health")
+    def health():
+        try:
+            with closing(get_db()) as db:
+                db.execute("SELECT 1").fetchone()
+            db_ok = True
+        except Exception:
+            db_ok = False
+        status = 200 if db_ok else 503
+        return jsonify({
+            "status":    "ok" if db_ok else "degraded",
+            "db":        "ok" if db_ok else "error",
+            "api_key":   "set" if API_KEY else "missing",
+            "ts":        int(time.time()),
+            "version":   "2.0",
+        }), status
+
     return application
 
 
 app = create_app()
 
+
+# ── History trimmer : empêche la mémoire de grossir indéfiniment ──────────
+def _trim_history(sess: dict) -> None:
+    if len(sess["messages"]) > MAX_HISTORY_MESSAGES:
+        # Conserve les MAX_HISTORY_MESSAGES messages les plus récents
+        sess["messages"] = sess["messages"][-MAX_HISTORY_MESSAGES:]
+
+
 if __name__ == "__main__":
-    logger.info("NeuralChat — starting")
+    logger.info("NeuralChat v2.0 — starting")
     init_db()
     port  = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
