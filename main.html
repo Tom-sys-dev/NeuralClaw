@@ -264,11 +264,164 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
   display:inline-block;vertical-align:middle;
 }
 @keyframes spin2 { to { transform:rotate(360deg); } }
+.modal-close-btn {
   background: none; border: 1px solid var(--border); border-radius: 8px;
   color: var(--muted); padding: 6px 12px; cursor: pointer; font-size: 13px;
   transition: all .2s; font-family: 'Syne', sans-serif; font-weight: 600;
 }
 .modal-close-btn:hover { border-color: var(--text); color: var(--text); }
+
+/* ── Copy button on messages ── */
+.copy-btn {
+  background: none; border: 1px solid transparent; border-radius: 6px;
+  color: var(--muted); font-size: 11px; padding: 3px 8px;
+  cursor: pointer; transition: all .2s; font-family: 'JetBrains Mono', monospace;
+  opacity: 0; margin-left: 8px; white-space: nowrap;
+}
+.msg-wrapper:hover .copy-btn { opacity: 1; }
+.copy-btn:hover { border-color: var(--accent2); color: var(--accent2); }
+.copy-btn.copied { color: var(--success); border-color: var(--success); opacity: 1; }
+
+/* ── Token counter topbar ── */
+#token-counter {
+  font-size: 10px; color: var(--muted); font-family: 'JetBrains Mono', monospace;
+  padding: 4px 10px; border: 1px solid var(--border); border-radius: 20px;
+  white-space: nowrap;
+}
+#token-counter.warn { color: var(--warn); border-color: var(--warn); }
+#token-counter.danger { color: var(--danger); border-color: var(--danger); }
+
+/* ── Theme toggle ── */
+#theme-toggle {
+  background: none; border: 1px solid var(--border); border-radius: 8px;
+  color: var(--muted); padding: 6px 10px; cursor: pointer; font-size: 14px;
+  transition: all .2s; line-height: 1;
+}
+#theme-toggle:hover { border-color: var(--accent2); color: var(--accent2); }
+
+/* ── Light theme override ── */
+body.light-theme {
+  --bg: #f1f5f9; --panel: #ffffff; --border: #cbd5e1;
+  --user-bg: #2563eb; --bot-bg: #f8fafc; --text: #0f172a; --muted: #64748b;
+}
+body.light-theme .bubble.user { color: #fff; }
+body.light-theme #ide-editor { background: #f8fafc; color: #1e293b; }
+
+/* ── Chat search ── */
+#chat-search-bar {
+  display: none; position: absolute; top: 58px; right: 24px; z-index: 50;
+  background: var(--panel); border: 1px solid var(--accent); border-radius: 12px;
+  padding: 10px 14px; gap: 10px; align-items: center;
+  box-shadow: 0 8px 30px rgba(0,0,0,.4);
+}
+#chat-search-bar.visible { display: flex; }
+#chat-search-input {
+  background: var(--bg); border: none; outline: none; color: var(--text);
+  font-family: 'JetBrains Mono', monospace; font-size: 13px; width: 220px;
+}
+#chat-search-nav { display: flex; gap: 4px; align-items: center; }
+.csn-btn {
+  background: none; border: 1px solid var(--border); border-radius: 6px;
+  color: var(--muted); padding: 4px 8px; cursor: pointer; font-size: 12px;
+  transition: all .2s;
+}
+.csn-btn:hover { border-color: var(--accent); color: var(--accent); }
+#chat-search-count { font-size: 11px; color: var(--muted); min-width: 50px; text-align: center; }
+.msg-highlight { background: rgba(59,130,246,.25); border-radius: 4px; }
+
+/* ── Scroll-to-bottom button ── */
+#scroll-bottom-btn {
+  position: fixed; bottom: 160px; right: 28px; z-index: 40;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 50%;
+  width: 40px; height: 40px; display: flex; align-items: center; justify-content: center;
+  cursor: pointer; font-size: 18px; box-shadow: 0 4px 16px rgba(0,0,0,.3);
+  transition: all .2s; opacity: 0; pointer-events: none;
+}
+#scroll-bottom-btn.visible { opacity: 1; pointer-events: auto; }
+#scroll-bottom-btn:hover { border-color: var(--accent); transform: scale(1.08); }
+
+/* ── Char counter ── */
+#char-counter {
+  font-size: 10px; color: var(--muted); font-family: 'JetBrains Mono', monospace;
+  padding: 2px 8px; align-self: flex-end; flex-shrink: 0;
+}
+#char-counter.warn   { color: var(--warn); }
+#char-counter.danger { color: var(--danger); }
+
+/* ── Conversation title ── */
+#chat-title-bar {
+  display: none; padding: 4px 24px 0; align-items: center; gap: 8px; flex-shrink: 0;
+}
+#chat-title-bar.visible { display: flex; }
+#chat-title-text {
+  font-size: 11px; font-family: 'Syne', sans-serif; font-weight: 600;
+  color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px;
+  cursor: pointer; padding: 2px 6px; border-radius: 4px; transition: all .2s;
+}
+#chat-title-text:hover { color: var(--accent2); background: rgba(6,182,212,.08); }
+#chat-title-refresh {
+  background: none; border: none; color: var(--muted); cursor: pointer; font-size: 12px; padding: 2px 4px; transition: all .2s;
+}
+#chat-title-refresh:hover { color: var(--accent2); }
+
+/* ── Message edit overlay ── */
+.edit-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 1500;
+  display: flex; align-items: center; justify-content: center; opacity: 0; visibility: hidden; transition: all .25s;
+}
+.edit-overlay.active { opacity: 1; visibility: visible; }
+.edit-box {
+  background: var(--panel); border: 1px solid var(--accent); border-radius: 16px;
+  padding: 24px; width: 90%; max-width: 640px; display: flex; flex-direction: column; gap: 14px;
+  box-shadow: 0 0 60px rgba(59,130,246,.2);
+}
+.edit-box h3 { font-family: 'Syne', sans-serif; font-size: 16px; font-weight: 700; }
+.edit-box textarea {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+  color: var(--text); font-family: 'JetBrains Mono', monospace; font-size: 13px;
+  padding: 12px; outline: none; resize: vertical; min-height: 120px; transition: border-color .2s;
+}
+.edit-box textarea:focus { border-color: var(--accent); }
+.edit-box-actions { display: flex; gap: 10px; justify-content: flex-end; }
+
+/* ── Template card ── */
+.template-card {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+  padding: 12px 14px; cursor: pointer; transition: all .2s; display: flex; align-items: flex-start; gap: 10px;
+}
+.template-card:hover { border-color: var(--accent2); background: rgba(6,182,212,.05); }
+.template-card .tc-name { font-family: 'Syne', sans-serif; font-size: 12px; font-weight: 700; color: var(--text); margin-bottom: 3px; }
+.template-card .tc-preview { font-size: 11px; color: var(--muted); line-height: 1.5; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.template-card .tc-del { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 14px; padding: 2px 6px; border-radius: 4px; margin-left: auto; flex-shrink: 0; transition: all .15s; }
+.template-card .tc-del:hover { color: var(--danger); background: rgba(239,68,68,.1); }
+.template-card .tc-cat { font-size: 9px; padding: 2px 6px; border-radius: 8px; background: rgba(6,182,212,.15); color: var(--accent2); margin-bottom: 4px; display: inline-block; }
+
+/* ── Sidebar resize handle ── */
+#sidebar-resize {
+  width: 4px; cursor: col-resize; background: transparent; flex-shrink: 0;
+  transition: background .2s; z-index: 10; position: relative;
+}
+#sidebar-resize:hover, #sidebar-resize.dragging { background: var(--accent); }
+@media (max-width: 1024px) { #sidebar-resize { display: none; } }
+
+/* ── Export format menu ── */
+.export-menu {
+  position: relative; display: inline-block; width: 100%;
+}
+.export-dropdown {
+  position: absolute; bottom: calc(100% + 6px); left: 0;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 6px; min-width: 180px; box-shadow: 0 8px 24px rgba(0,0,0,.4);
+  z-index: 200; opacity: 0; visibility: hidden; transition: all .2s;
+}
+.export-menu:hover .export-dropdown { opacity: 1; visibility: visible; }
+.export-option {
+  display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+  border-radius: 6px; cursor: pointer; font-size: 12px; color: var(--muted);
+  transition: all .15s; background: none; border: none; width: 100%; text-align: left;
+  font-family: 'JetBrains Mono', monospace;
+}
+.export-option:hover { background: rgba(255,255,255,.05); color: var(--text); }
 
 /* ── Special toolbar buttons ── */
 .special-tools {
@@ -825,6 +978,24 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
 <body>
 
 <!-- ══════════════════════════════════════════════════════════
+     📚 PROMPT TEMPLATES MODAL
+══════════════════════════════════════════════════════════ -->
+<div class="modal-overlay" id="templates-modal" onclick="if(event.target===this)closeTemplatesModal()">
+  <div class="modal" style="max-width:520px;max-height:80vh;overflow-y:auto;">
+    <h2>📚 Bibliothèque de Prompts</h2>
+    <input type="text" class="modal-input" id="templates-search" placeholder="🔍 Rechercher un template…" oninput="filterTemplates(this.value)" style="margin-bottom:12px;"/>
+    <div id="templates-list" style="display:flex;flex-direction:column;gap:8px;max-height:420px;overflow-y:auto;"></div>
+    <div style="display:flex;gap:8px;margin-top:16px;border-top:1px solid var(--border);padding-top:14px;">
+      <input type="text" class="modal-input" id="new-template-name" placeholder="Nom du template…" style="flex:1;margin-bottom:0;"/>
+      <button class="btn btn-secondary" onclick="saveCurrentAsTemplate()" style="white-space:nowrap;flex-shrink:0;">💾 Sauvegarder le message</button>
+    </div>
+    <div class="modal-buttons" style="margin-top:10px;">
+      <button class="btn btn-ghost" onclick="closeTemplatesModal()">Fermer</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
      SKILL MODAL
 ══════════════════════════════════════════════════════════ -->
 <div class="modal-overlay" id="skill-modal">
@@ -1262,7 +1433,14 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
   </div>
 
   <div style="display:flex;flex-direction:column;gap:8px;margin-top:auto;">
-    <button class="btn btn-ghost btn-full" onclick="exportChat()">⬇ Exporter la conv.</button>
+    <div class="export-menu">
+      <button class="btn btn-ghost btn-full">⬇ Exporter la conv. ▾</button>
+      <div class="export-dropdown">
+        <button class="export-option" onclick="exportChat('md')">📄 Markdown (.md)</button>
+        <button class="export-option" onclick="exportChat('json')">📦 JSON (.json)</button>
+        <button class="export-option" onclick="exportChat('txt')">📝 Texte (.txt)</button>
+      </div>
+    </div>
     <button class="btn btn-danger btn-full" onclick="clearChat()">✕ Effacer la mémoire</button>
   </div>
 </aside>
@@ -1271,16 +1449,33 @@ select:focus, textarea:focus, input:focus { border-color: var(--accent); }
      MAIN AREA
 ══════════════════════════════════════════════════════════ -->
 <div id="app-wrapper">
-  <div id="topbar">
+  <div id="topbar" style="position:relative;">
     <button id="sidebar-toggle" onclick="toggleSidebar()">☰</button>
     <span style="font-family:'Syne',sans-serif;font-weight:700;font-size:15px;color:var(--text);">💬 Chat</span>
     <div id="topbar-right">
       <span id="skills-indicator">✨ Skills actifs</span>
       <span id="context-indicator">Contexte actif</span>
+      <span id="token-counter" style="display:none;">0 tokens</span>
       <span id="model-badge">{{ default_model }}</span>
+      <button id="theme-toggle" onclick="toggleTheme()" title="Changer de thème">🌙</button>
+      <button class="tool-btn" onclick="toggleChatSearch()" title="Rechercher dans le chat (Ctrl+F)" style="border-color:rgba(59,130,246,.4);color:var(--accent);">🔍</button>
       <div id="auth-zone"></div>
     </div>
+    <!-- Chat search bar -->
+    <div id="chat-search-bar">
+      <span style="color:var(--muted);font-size:12px;">🔍</span>
+      <input id="chat-search-input" placeholder="Rechercher dans le chat…" oninput="chatSearchQuery(this.value)" onkeydown="chatSearchKey(event)"/>
+      <div id="chat-search-nav">
+        <span id="chat-search-count">0 / 0</span>
+        <button class="csn-btn" onclick="chatSearchNav(-1)" title="Précédent">↑</button>
+        <button class="csn-btn" onclick="chatSearchNav(1)" title="Suivant">↓</button>
+        <button class="csn-btn" onclick="closeChatSearch()">✕</button>
+      </div>
+    </div>
   </div>
+
+  <!-- Scroll to bottom -->
+  <button id="scroll-bottom-btn" onclick="scrollToBottom(true)" title="Défiler vers le bas">↓</button>
 
   <div id="messages">
     <div id="welcome">
@@ -1566,26 +1761,44 @@ function appendMessage(role, text) {
   bubble.className = `bubble ${role}`;
 
   if (role === 'bot') {
-    // Traiter les blocs Mermaid séparément du reste du markdown
     bubble.innerHTML = renderWithMermaid(text);
     bubble.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
-    // Rendre les diagrammes Mermaid
     renderMermaidInElement(bubble);
   } else {
-    bubble.innerHTML = escHtml(text);
+    bubble.innerHTML = escHtml(text).replace(/\n/g, '<br>');
   }
+
+  // Copy button
+  const copyBtn = document.createElement('button');
+  copyBtn.className = 'copy-btn';
+  copyBtn.textContent = '📋 Copier';
+  copyBtn.onclick = () => {
+    navigator.clipboard.writeText(text).then(() => {
+      copyBtn.textContent = '✓ Copié';
+      copyBtn.classList.add('copied');
+      setTimeout(() => { copyBtn.textContent = '📋 Copier'; copyBtn.classList.remove('copied'); }, 2000);
+    }).catch(() => showToast('Erreur copie', 'error'));
+  };
 
   const time = document.createElement('div');
   time.className   = 'msg-time';
-  time.textContent = new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
-  if (role === 'user') time.style.textAlign = 'right';
+  time.style.display = 'flex'; time.style.alignItems = 'center';
+  time.innerHTML = `<span>${new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}</span>`;
+  time.appendChild(copyBtn);
+  if (role === 'user') time.style.justifyContent = 'flex-end';
 
   inner.append(bubble, time);
   if (role === 'user') wrapper.append(inner, avatar);
   else                 wrapper.append(avatar, inner);
 
   container.insertBefore(wrapper, typing);
-  container.scrollTop = container.scrollHeight;
+
+  // Smart scroll: only auto-scroll if user is near the bottom
+  const isNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 120;
+  if (isNearBottom || role === 'user') {
+    container.scrollTop = container.scrollHeight;
+  }
+  updateScrollBtn();
 }
 
 function renderWithMermaid(text) {
@@ -1618,6 +1831,15 @@ function setTyping(on) {
 function updateStats(msgs, tokens) {
   document.getElementById('stat-msgs').textContent   = msgs   ?? '–';
   document.getElementById('stat-tokens').textContent = tokens ?? '–';
+  // Token counter in topbar
+  const tc = document.getElementById('token-counter');
+  if (tokens && tokens > 0) {
+    tc.textContent = tokens > 1000 ? `${Math.round(tokens/1000)}k tokens` : `${tokens} tokens`;
+    tc.style.display = 'inline';
+    tc.className = tokens > 50000 ? 'danger' : tokens > 20000 ? 'warn' : '';
+  } else {
+    tc.style.display = 'none';
+  }
 }
 
 /* ===================================================
@@ -1638,24 +1860,47 @@ async function clearChat() {
   showToast('Mémoire effacée', 'success');
 }
 
-async function exportChat() {
+async function exportChat(format = 'md') {
   const res  = await fetch('/api/history');
   const data = await res.json();
   if (!data.messages?.length) return showToast('Aucun message à exporter', 'error');
 
-  let md = '# Conversation — ' + new Date().toLocaleString('fr-FR') + '\n\n';
-  if (currentUser) md += '> **Utilisateur :** ' + currentUser.username + '\n\n';
-  if (data.system_prompt) md += '> **Contexte :** ' + data.system_prompt + '\n\n';
-  if (data.skills?.length) md += '> **Skills :** ' + data.skills.join(', ') + '\n\n---\n\n';
-  data.messages.forEach(m => {
-    md += (m.role === 'user' ? '**Vous**' : '**IA**') + '\n\n' + m.content + '\n\n---\n\n';
-  });
+  let content, ext, mime;
+
+  if (format === 'json') {
+    content = JSON.stringify({
+      exported_at: new Date().toISOString(),
+      user: currentUser?.username || 'anonyme',
+      model: data.model,
+      system_prompt: data.system_prompt,
+      skills: data.skills,
+      messages: data.messages,
+    }, null, 2);
+    ext = 'json'; mime = 'application/json';
+  } else if (format === 'txt') {
+    content = `Conversation — ${new Date().toLocaleString('fr-FR')}\n\n`;
+    data.messages.forEach(m => {
+      content += (m.role === 'user' ? '[VOUS]' : '[IA]') + '\n' + m.content + '\n\n---\n\n';
+    });
+    ext = 'txt'; mime = 'text/plain';
+  } else {
+    // markdown (default)
+    let md = '# Conversation — ' + new Date().toLocaleString('fr-FR') + '\n\n';
+    if (currentUser) md += '> **Utilisateur :** ' + currentUser.username + '\n\n';
+    if (data.system_prompt) md += '> **Contexte :** ' + data.system_prompt + '\n\n';
+    if (data.skills?.length) md += '> **Skills :** ' + data.skills.join(', ') + '\n\n---\n\n';
+    data.messages.forEach(m => {
+      md += (m.role === 'user' ? '**Vous**' : '**IA**') + '\n\n' + m.content + '\n\n---\n\n';
+    });
+    content = md; ext = 'md'; mime = 'text/markdown';
+  }
+
   const a = Object.assign(document.createElement('a'), {
-    href: URL.createObjectURL(new Blob([md], { type: 'text/markdown' })),
-    download: 'conversation_' + Date.now() + '.md'
+    href: URL.createObjectURL(new Blob([content], { type: mime })),
+    download: `conversation_${Date.now()}.${ext}`
   });
   a.click();
-  showToast('Exporté', 'success');
+  showToast(`Exporté (${ext.toUpperCase()})`, 'success');
 }
 
 /* ===================================================
@@ -2440,15 +2685,6 @@ function showToast(msg, type = '') {
   t._tid = setTimeout(() => t.className = '', 3000);
 }
 
-// Fermer les overlays avec Escape
-document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') {
-    closeSkillModal();
-    closeWarRoom();
-    closeAdvocate();
-  }
-});
-
 // Fermer en cliquant en dehors du modal
 ['warroom-overlay','advocate-overlay'].forEach(id => {
   document.getElementById(id).addEventListener('click', function(e) {
@@ -2488,6 +2724,9 @@ document.addEventListener('keydown', e => {
       if (sel) sel.value = data.lang;
     }
   } catch (e) { console.error('Init error:', e); }
+
+  // Keepalive ping toutes les 4 minutes pour éviter la mise en veille Render
+  setInterval(() => fetch('/api/ping').catch(() => {}), 4 * 60 * 1000);
 })();
 
 /* ===================================================
@@ -2859,6 +3098,189 @@ document.getElementById('ide-ai-input').addEventListener('input', function() {
 /* Keyboard shortcut: Ctrl+Enter / Cmd+Enter to run */
 ideEditor.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); ideRun(); }
+});
+
+/* ===================================================
+   🌙 THEME TOGGLE
+   =================================================== */
+let isDarkTheme = true;
+
+function toggleTheme() {
+  isDarkTheme = !isDarkTheme;
+  document.body.classList.toggle('light-theme', !isDarkTheme);
+  document.getElementById('theme-toggle').textContent = isDarkTheme ? '🌙' : '☀️';
+  try { localStorage.setItem('nc_theme', isDarkTheme ? 'dark' : 'light'); } catch {}
+}
+
+// Restore saved theme
+try {
+  const saved = localStorage.getItem('nc_theme');
+  if (saved === 'light') { isDarkTheme = false; document.body.classList.add('light-theme'); document.getElementById('theme-toggle').textContent = '☀️'; }
+} catch {}
+
+/* ===================================================
+   🔍 CHAT SEARCH
+   =================================================== */
+let chatSearchResults = [];
+let chatSearchIndex   = 0;
+
+function toggleChatSearch() {
+  const bar = document.getElementById('chat-search-bar');
+  const visible = bar.classList.toggle('visible');
+  if (visible) {
+    document.getElementById('chat-search-input').focus();
+  } else {
+    clearChatSearch();
+  }
+}
+
+function closeChatSearch() {
+  document.getElementById('chat-search-bar').classList.remove('visible');
+  clearChatSearch();
+}
+
+function clearChatSearch() {
+  document.querySelectorAll('.msg-highlight').forEach(el => {
+    el.outerHTML = el.textContent;
+  });
+  chatSearchResults = [];
+  chatSearchIndex   = 0;
+  document.getElementById('chat-search-count').textContent = '0 / 0';
+  document.getElementById('chat-search-input').value = '';
+}
+
+function chatSearchQuery(query) {
+  // Remove previous highlights
+  document.querySelectorAll('.msg-highlight').forEach(el => {
+    const parent = el.parentNode;
+    parent.replaceChild(document.createTextNode(el.textContent), el);
+    parent.normalize();
+  });
+  chatSearchResults = [];
+  chatSearchIndex   = 0;
+
+  if (!query.trim()) {
+    document.getElementById('chat-search-count').textContent = '0 / 0';
+    return;
+  }
+
+  const bubbles = document.querySelectorAll('.bubble');
+  bubbles.forEach(bubble => {
+    highlightTextInElement(bubble, query);
+  });
+
+  chatSearchResults = Array.from(document.querySelectorAll('.msg-highlight'));
+  document.getElementById('chat-search-count').textContent =
+    chatSearchResults.length > 0 ? `1 / ${chatSearchResults.length}` : '0 / 0';
+
+  if (chatSearchResults.length > 0) {
+    chatSearchIndex = 0;
+    chatSearchScrollTo(0);
+  }
+}
+
+function highlightTextInElement(element, query) {
+  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, null);
+  const nodesToProcess = [];
+  let node;
+  while ((node = walker.nextNode())) {
+    if (node.textContent.toLowerCase().includes(query.toLowerCase())) {
+      nodesToProcess.push(node);
+    }
+  }
+  nodesToProcess.forEach(textNode => {
+    const parent = textNode.parentNode;
+    if (parent.nodeName === 'SCRIPT' || parent.nodeName === 'STYLE') return;
+    const frag = document.createDocumentFragment();
+    const parts = textNode.textContent.split(new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')})`, 'gi'));
+    parts.forEach(part => {
+      if (part.toLowerCase() === query.toLowerCase()) {
+        const mark = document.createElement('mark');
+        mark.className = 'msg-highlight';
+        mark.textContent = part;
+        frag.appendChild(mark);
+      } else {
+        frag.appendChild(document.createTextNode(part));
+      }
+    });
+    parent.replaceChild(frag, textNode);
+  });
+}
+
+function chatSearchNav(direction) {
+  if (!chatSearchResults.length) return;
+  chatSearchIndex = (chatSearchIndex + direction + chatSearchResults.length) % chatSearchResults.length;
+  document.getElementById('chat-search-count').textContent = `${chatSearchIndex + 1} / ${chatSearchResults.length}`;
+  chatSearchScrollTo(chatSearchIndex);
+}
+
+function chatSearchScrollTo(idx) {
+  const el = chatSearchResults[idx];
+  if (!el) return;
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  // Briefly highlight current
+  chatSearchResults.forEach((r, i) => {
+    r.style.background = i === idx ? 'rgba(59,130,246,.5)' : 'rgba(59,130,246,.25)';
+  });
+}
+
+function chatSearchKey(e) {
+  if (e.key === 'Enter') chatSearchNav(e.shiftKey ? -1 : 1);
+  if (e.key === 'Escape') closeChatSearch();
+}
+
+/* ===================================================
+   ↓ SCROLL-TO-BOTTOM BUTTON
+   =================================================== */
+function updateScrollBtn() {
+  const msgs = document.getElementById('messages');
+  const btn  = document.getElementById('scroll-bottom-btn');
+  if (!msgs || !btn) return;
+  const isNearBottom = msgs.scrollHeight - msgs.scrollTop - msgs.clientHeight < 150;
+  btn.classList.toggle('visible', !isNearBottom && msgs.scrollHeight > msgs.clientHeight + 200);
+}
+
+function scrollToBottom(smooth = false) {
+  const msgs = document.getElementById('messages');
+  msgs.scrollTo({ top: msgs.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+  updateScrollBtn();
+}
+
+document.getElementById('messages').addEventListener('scroll', updateScrollBtn);
+
+/* ===================================================
+   ⌨️ ADDITIONAL KEYBOARD SHORTCUTS
+   =================================================== */
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    closeSkillModal(); closeWarRoom(); closeAdvocate(); closeChatSearch();
+  }
+  // Ctrl+F = search in chat
+  if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+    const focused = document.activeElement;
+    const inChat  = focused === document.getElementById('message-input') ||
+                    document.getElementById('ide-overlay').classList.contains('active') ||
+                    document.getElementById('warroom-overlay').classList.contains('active') ||
+                    document.getElementById('advocate-overlay').classList.contains('active');
+    if (!inChat) {
+      e.preventDefault();
+      toggleChatSearch();
+    }
+  }
+  // Ctrl+K = clear chat
+  if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+    const inInput = document.activeElement === document.getElementById('message-input') ||
+                    document.activeElement === document.getElementById('ide-editor');
+    if (!inInput) {
+      e.preventDefault();
+      clearChat();
+    }
+  }
+  // Ctrl+/ = focus message input
+  if ((e.ctrlKey || e.metaKey) && e.key === '/') {
+    e.preventDefault();
+    document.getElementById('message-input').focus();
+  }
 });
 </script>
 </body>
